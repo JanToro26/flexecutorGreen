@@ -1,0 +1,54 @@
+# AWS Lambda + S3 backend.
+#
+# Ported from flexecutor-main/config_aws.yaml.template, with his dead keys
+# removed: cost_simulation, performance_tracking, ENERGY_MONITORING_ENABLED,
+# COST_SIMULATION_ENABLED, WORKLOAD_TYPE and MEASUREMENT_FUNCTIONS are not read
+# by Lithops or by the EnergyManager anywhere - they were inert.
+#
+#   LITHOPS_CONFIG_FILE=config/config_aws.yaml python examples/energy_apps/run.py profile
+#
+# On Lambda, RAPL and perf are unavailable: the psutil power model is the ONLY
+# mechanism, so every energy figure is TDP x fitted constants. Check
+# worker_func_psutil_cpu_tdp_is_default in the stats - if it is True, the TDP
+# never resolved and that run should not be used for absolute joules.
+
+lithops:
+    backend: aws_lambda
+    storage: aws_s3
+    data_cleaner: True
+    execution_timeout: 300
+    log_level: INFO
+    runtime_version_tolerance: 1
+
+aws:
+    AWS_ACCESS_KEY_ID: "ACCESS_KEY_ID"
+    AWS_SECRET_ACCESS_KEY: "SECRET_ACCESS_KEY"
+    AWS_SESSION_TOKEN: "SESSION_TOKEN"
+    region: us-east-1
+
+aws_lambda:
+    execution_role: arn:aws:iam::ACCOUNT_ID:role/lambdaLithopsExecutionRole
+    runtime_timeout: 300
+
+    # Memory is the axis worth sweeping here: on Lambda, CPU is allocated in
+    # proportion to memory, so this is also the CPU knob. Iñigo used
+    # 512 / 1024 / 2048. Pass  with --memory 512 1024 2048.
+    runtime_memory: 1024
+
+    # Architecture is the other axis. Iñigo measured ARM64 (Graviton2) at
+    # 30-50% lower energy than x86_64 at comparable times; reproducing that
+    # comparison means running the same sweep twice, once per architecture.
+    architecture: x86_64
+    # architecture: arm64
+
+    # The apps in examples/energy_apps only need numpy + scikit-learn.
+    # runtime: YOUR_RUNTIME_NAME
+
+    max_workers: 1000
+    worker_processes: 1
+    invoke_pool_threads: 64
+    ephemeral_storage: 512
+
+aws_s3:
+    storage_bucket: S3_BUCKET_NAME
+    region: us-east-1

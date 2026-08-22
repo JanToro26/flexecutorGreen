@@ -1,0 +1,49 @@
+# Localhost backend, for RAPL-capable runs.
+#
+# Ported from flexecutor-main/localhost_sudo.yaml. His version is three keys
+# (backend/storage/runtime: python3 + worker_processes: 2); the notes below are
+# what is actually needed to get energy counters out of it.
+#
+#   LITHOPS_CONFIG_FILE=config/localhost_sudo.yaml python examples/energy_apps/run.py profile
+#
+# RAPL requires ALL of:
+#   * Linux. There is no /sys/class/powercap on Windows or macOS, so on a Windows laptop
+#     laptop only the psutil power model will report, and every joule it
+#     produces is TDP x fitted constants, not a measurement.
+#   * Read access to /sys/class/powercap/intel-rapl:*/energy_uj. Since Linux
+#     5.10 these are root-only (CVE-2020-8694). Either run as root or:
+#         sudo chmod -R a+r /sys/class/powercap/intel-rapl*
+#   * An Intel or AMD CPU that exposes the powercap interface at all.
+#
+# Check before trusting a run:
+#   ls /sys/class/powercap/intel-rapl*/     -> domains must exist
+#   cat /sys/class/powercap/intel-rapl:0/name  -> should print "package-0"
+#
+# perf (opt-in) additionally needs LITHOPS_ENERGY_PERF=1 and
+# perf_event_paranoid <= 0. It measures the WHOLE machine, so with W concurrent
+# workers every worker reports the same figure -- never sum those.
+
+lithops:
+    backend: localhost
+    storage: localhost
+    log_level: INFO
+
+localhost:
+    # Linux / macOS: the interpreter name is enough.
+    runtime: python3
+
+    # Windows: python3 does not resolve. Point at the venv interpreter instead,
+    # e.g. the one already used by lithops_green/.lithops_config:
+    # runtime: C:/Users/janto/Documents/TFG/Code/lithops_green/.venv/Scripts/python.exe
+
+    # Workers that run concurrently on this host.
+    #
+    # This is the single most important knob for energy measurement on
+    # localhost. The stage's `workers` count is how many invocations are
+    # created; `worker_processes` is how many of them run AT THE SAME TIME. If
+    # worker_processes < workers, the invocations are serialised, wall time
+    # grows and the "parallelism" axis being profiled is not the one the
+    # machine executed. Set it to at least the largest worker count swept,
+    # and no higher than your physical core count -- past that the result will be
+    # measuring oversubscription, not parallelism.
+    worker_processes: 8
