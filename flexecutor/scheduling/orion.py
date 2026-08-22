@@ -1,10 +1,10 @@
 import heapq
 from typing import List
 
-from modelling.perfmodel import PerfModelEnum
-from scheduling.scheduler import Scheduler
-from scheduling.utils import get_size_by_s3_prefix
-from utils.dataclass import StageConfig
+from flexecutor.modelling.perfmodel import PerfModelEnum
+from flexecutor.scheduling.scheduler import Scheduler
+from flexecutor.scheduling.utils import get_size_by_s3_prefix
+from flexecutor.utils.dataclass import StageConfig
 
 
 class MyQueue:

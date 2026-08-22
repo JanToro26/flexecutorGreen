@@ -1,8 +1,8 @@
 import math
 
-from modelling.perfmodel import PerfModelEnum
-from scheduling.scheduler import Scheduler
-from utils.dataclass import StageConfig
+from flexecutor.modelling.perfmodel import PerfModelEnum
+from flexecutor.scheduling.scheduler import Scheduler
+from flexecutor.utils.dataclass import StageConfig
 
 
 class VirtualStage:
@@ -121,8 +121,10 @@ class Ditto(Scheduler):
         self.roots = []
         self.leafs = []
 
-        if objective not in ["latency", "cost"]:
-            raise ValueError("Invalid objective. Should be 'latency' or 'cost'")
+        if objective not in ["latency", "cost", "energy"]:
+            raise ValueError(
+                "Invalid objective. Should be 'latency', 'cost' or 'energy'"
+            )
         self.objective = objective
 
     def _assign(self, v_stage: VirtualStage, degree: float):
@@ -157,6 +159,52 @@ class Ditto(Scheduler):
             param_a_dict[stage.stage_id] = param_a
         sum_a = sum(param_a_dict.values())
         self.parallelism_ratios = {k: v / sum_a for k, v in param_a_dict.items()}
+
+    def _schedule_for_energy(self):
+        """
+        Distribute the parallelism budget across stages by measured energy
+        sensitivity.
+
+        Each stage has a fitted affine energy model E_s(x) = a_s * x + b_s over
+        the allocated resource x, where a_s is how much extra energy that stage
+        pays for each extra unit of parallelism (see
+        ``AnaPerfModel.energy_parameters``). To minimise total energy under a
+        fixed parallelism budget, give parallelism to the stages that are cheap
+        to parallelise and withhold it from the expensive ones, so the share of
+        stage s is proportional to 1 / a_s.
+
+        A stage with a_s <= 0 got cheaper as it was given more resources -- real
+        when a longer-running stage holds idle silicon powered for longer. Those
+        stages are treated as maximally worth parallelising rather than being
+        allowed to produce a negative share.
+
+        This refuses to run without fitted energy models instead of falling
+        back to a time-based proxy. A proxy would silently turn "scheduled for
+        energy" into "scheduled for latency under a different name", and the
+        resulting allocation would be indistinguishable from a real one in the
+        output.
+        """
+        unfitted = [
+            stage.stage_id
+            for stage in self._dag.stages
+            if not getattr(stage.perf_model, "has_energy_model", False)
+        ]
+        if unfitted:
+            raise ValueError(
+                "Cannot schedule for energy: no fitted energy model for stage(s) "
+                f"{unfitted}. Profile these stages with an energy monitor active "
+                "(at least two configurations) before using objective='energy'."
+            )
+
+        weights = {}
+        for stage in self._dag.stages:
+            a, _ = stage.perf_model.energy_parameters
+            # Small floor rather than zero: a_s == 0 means energy is flat in
+            # parallelism, i.e. the stage is free to widen.
+            weights[stage.stage_id] = 1.0 / max(a, 1e-6) if a > 0 else 1.0 / 1e-6
+
+        total = sum(weights.values())
+        self.parallelism_ratios = {k: v / total for k, v in weights.items()}
 
     def _schedule_for_latency(self):
         if len(self.leafs) != 1:
@@ -251,6 +299,8 @@ class Ditto(Scheduler):
             self._schedule_for_latency()
         elif self.objective == "cost":
             self._schedule_for_cost()
+        elif self.objective == "energy":
+            self._schedule_for_energy()
         else:
             raise ValueError("Invalid objective")
 

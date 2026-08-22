@@ -5,11 +5,11 @@ from typing import Optional, Union
 import black
 import numpy as np
 
-from modelling.perfmodel import PerfModelEnum
-from scheduling.orion import MyQueue
-from scheduling.scheduler import Scheduler
-from utils.dataclass import StageConfig
-from workflow.stage import Stage
+from flexecutor.modelling.perfmodel import PerfModelEnum
+from flexecutor.scheduling.orion import MyQueue
+from flexecutor.scheduling.scheduler import Scheduler
+from flexecutor.utils.dataclass import StageConfig
+from flexecutor.workflow.stage import Stage
 
 workers_accessor = slice(0, None, 2)
 cpu_accessor = slice(1, None, 2)
@@ -43,7 +43,13 @@ class Jolteon(Scheduler):
         critical_path: Optional[list[Stage]] = None,
         secondary_path: Optional[list[Stage]] = None,
     ):
-        assert bound_type in ["latency", "cost"]
+        # bound_type names the CONSTRAINT, not the objective. "energy"
+        # therefore means: minimise latency subject to a total-energy budget.
+        # The energy expression is built from each stage's fitted power model
+        # (MixedPerfModel._fit_power_params); stages profiled without an energy
+        # monitor raise rather than falling back, so an "energy" run cannot
+        # silently reduce to a latency run.
+        assert bound_type in ["latency", "cost", "energy"]
 
         super().__init__(dag, PerfModelEnum.MIXED)
 
