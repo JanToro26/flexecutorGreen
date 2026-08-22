@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 from itertools import chain
 
 install_requires = [
-    "cloud-dataplug @ git+https://github.com/CLOUDLAB-URV/dataplug",
-    "lithops==3.4.1",
+    #"cloud-dataplug @ git+https://github.com/CLOUDLAB-URV/dataplug",
+    "lithops",
     "boto3",
     "cloudpickle",
     "overrides",
@@ -37,7 +37,7 @@ setup(
     "stepan.klymonchuk@urv.cat",
     description="A flexible and DAG-optimized executor over Lithops",
     url="https://github.com/CLOUDLAB-URV/flexecutor",
-    long_description=open("README.md").read(),
+    long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     license="Apache 2.0",
     license_files=["LICENSE"],
