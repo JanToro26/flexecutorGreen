@@ -4,6 +4,8 @@ from flexecutor.modelling.perfmodel import PerfModelEnum
 from flexecutor.scheduling.scheduler import Scheduler
 from flexecutor.utils.dataclass import StageConfig
 
+# Below this magnitude a fitted energy slope is indistinguishable from zero.
+ENERGY_SLOPE_TOL = 1e-9
 
 class VirtualStage:
     def __init__(self, param_a, idx=None):
@@ -109,12 +111,18 @@ def distance(stage0: VirtualStage, stage1: VirtualStage):
 
 class Ditto(Scheduler):
     def __init__(
-        self, dag, total_parallelism: int, cpu_per_worker: float, objective: str
-    ):
+        self,
+        dag,
+        total_parallelism: int,
+        cpu_per_worker: float,
+        objective: str,
+        flat_stage_boost: float = 10.0,
+        ):
         super().__init__(dag, PerfModelEnum.ANALYTIC)
         self.total_parallelism = total_parallelism
         self.cpu_per_worker = cpu_per_worker
         self.parallelism_ratios = {}
+        self.flat_stage_boost = flat_stage_boost
 
         # Init the virtual DAG
         self.virtual_stages = {}
@@ -173,10 +181,9 @@ class Ditto(Scheduler):
         to parallelise and withhold it from the expensive ones, so the share of
         stage s is proportional to 1 / a_s.
 
-        A stage with a_s <= 0 got cheaper as it was given more resources -- real
-        when a longer-running stage holds idle silicon powered for longer. Those
-        stages are treated as maximally worth parallelising rather than being
-        allowed to produce a negative share.
+        
+        A stage with a > tol gets 1/a. |a| <= tol is flat and gets flat_stage_boost
+        times the largest real weight; a < -tol is reported and treated as flat.
 
         This refuses to run without fitted energy models instead of falling
         back to a time-based proxy. A proxy would silently turn "scheduled for
@@ -196,12 +203,46 @@ class Ditto(Scheduler):
                 "(at least two configurations) before using objective='energy'."
             )
 
+        # a_s is the marginal energy cost of one more unit of parallelism.
+        # Three cases, and they are not the same case:
+        #   a > tol   the stage pays for parallelism; weight it by 1/a
+        #   |a| <= tol  energy is flat in parallelism; the stage is free to widen
+        #   a < -tol  the fit says energy falls as resources grow, which is
+        #             physically possible but far more often means the profile
+        #             does not constrain the fit
+        ENERGY_SLOPE_TOL = 1e-9
+        #FLAT_WEIGHT = 1.0 / 1e-6 ABANDONED CODE
+ 
+                # Pass 1: stages whose energy genuinely grows with parallelism. Their
+        # share is 1/a_s, so the steeper the stage, the less it gets.
         weights = {}
+        flat_stages = []
         for stage in self._dag.stages:
             a, _ = stage.perf_model.energy_parameters
-            # Small floor rather than zero: a_s == 0 means energy is flat in
-            # parallelism, i.e. the stage is free to widen.
-            weights[stage.stage_id] = 1.0 / max(a, 1e-6) if a > 0 else 1.0 / 1e-6
+            if a > ENERGY_SLOPE_TOL:
+                weights[stage.stage_id] = 1.0 / a
+            else:
+                if a < -ENERGY_SLOPE_TOL:
+                    print(
+                        f"[Ditto] Stage '{stage.stage_id}' fitted a negative energy "
+                        f"slope (a={a:.6g}). Treating it as flat; widen the profiled "
+                        "configuration space to confirm."
+                    )
+                flat_stages.append(stage.stage_id)
+
+        # Pass 2: a stage whose energy is flat in parallelism is worth widening,
+        # but the size of that preference has to be expressed relative to the
+        # stages it competes with. An absolute constant cannot be: any value
+        # large enough to mean "prefer this" for one DAG is large enough to take
+        # the entire budget in another, and a flat fit is the normal outcome of
+        # profiling over too narrow a range, so this is the common case rather
+        # than the exceptional one.
+        if flat_stages:
+            boost = (
+                max(weights.values()) * self.flat_stage_boost if weights else 1.0
+            )
+            for stage_id in flat_stages:
+                weights[stage_id] = boost
 
         total = sum(weights.values())
         self.parallelism_ratios = {k: v / total for k, v in weights.items()}
