@@ -6,8 +6,8 @@ import numpy as np
 import scipy.optimize as scipy_opt
 from overrides import overrides
 
-from modelling.perfmodel import PerfModel
-from utils.dataclass import StageConfig, FunctionTimes
+from flexecutor.modelling.perfmodel import PerfModel
+from flexecutor.utils.dataclass import StageConfig, FunctionTimes
 
 
 class ModelStrategy(ABC):
@@ -221,6 +221,10 @@ class MixedPerfModel(PerfModel, GetAndSet):
         self.can_intra_parallel = CanIntraParallel()
         self.parent_relevant = False
 
+        # (p_dyn, p_idle) in watts, fitted from measured energy during train().
+        # None means the energy objective is unavailable for this stage.
+        self._power_params = None
+
         self.params_avg = ModelParams()
         self.cov_avg = ModelCovariance()
 
@@ -262,7 +266,94 @@ class MixedPerfModel(PerfModel, GetAndSet):
                 coeff.const += params.compute[3] + params.write[1]
 
     @overrides
+    def _fit_power_params(self, stage_profile_data: Dict) -> None:
+        """
+        Fit a per-stage power model from measured energy:
+
+            P(k, d) = p_dyn * (k * d) + p_idle          [watts]
+            E(k, d) = P(k, d) * T(k, d)                 [joules]
+
+        Both coefficients come from least squares over the profiled
+        configurations. That is the whole point of the exercise: the structural
+        form (energy scales with resources held times time held) is assumed,
+        but the watts are measured, not a constant picked to make the numbers
+        move. A model of the shape `energy = 0.1 * vcpu * workers * time` with
+        a hard-coded 0.1 is not an energy model -- it is latency wearing an
+        energy label, and it will rank configurations exactly as latency does.
+
+        Sets ``self._power_params`` to None when the profile carries no usable
+        energy, which makes the energy objective refuse to run rather than
+        quietly degrade.
+        """
+        self._power_params = None
+
+        rows_x, rows_y = [], []
+        for config_tuple, data in stage_profile_data.items():
+            cpu, memory, workers = config_tuple
+            energy_runs = data.get("energy")
+            duration_runs = data.get("energy_duration")
+            if not energy_runs or not duration_runs:
+                continue
+
+            for e_run, d_run in zip(energy_runs, duration_runs):
+                e_vals = [v for v in (e_run or []) if isinstance(v, (int, float))
+                          and not isinstance(v, bool)]
+                d_vals = [v for v in (d_run or []) if isinstance(v, (int, float))
+                          and not isinstance(v, bool)]
+                if not e_vals or not d_vals:
+                    continue
+                # Stage energy is the sum over workers; stage duration is the
+                # slowest worker, because workers run concurrently.
+                stage_energy = float(sum(e_vals))
+                stage_duration = float(max(d_vals))
+                if stage_duration <= 0:
+                    continue
+                k = float(cpu) if cpu else 1.0
+                d = float(workers) if self.allow_parallel else 1.0
+                # E = (p_dyn * k*d + p_idle) * T  ->  linear in (k*d*T, T)
+                rows_x.append([k * d * stage_duration, stage_duration])
+                rows_y.append(stage_energy)
+
+        if len(rows_x) < 2:
+            print(
+                f"[MixedPerfModel:{self._model_name}] Not enough measured energy to fit "
+                "a power model; the energy objective is unavailable for this stage."
+            )
+            return
+
+        A = np.array(rows_x, dtype=float)
+        y = np.array(rows_y, dtype=float)
+        try:
+            coeffs, *_ = np.linalg.lstsq(A, y, rcond=None)
+        except np.linalg.LinAlgError as e:
+            print(f"[MixedPerfModel:{self._model_name}] Power fit failed: {e}")
+            return
+
+        p_dyn, p_idle = float(coeffs[0]), float(coeffs[1])
+        # Negative power is not physical; it means the profile does not
+        # constrain the fit. Report it instead of scheduling against it.
+        if p_dyn < 0 or p_idle < 0:
+            print(
+                f"[MixedPerfModel:{self._model_name}] Power fit produced non-physical "
+                f"coefficients (p_dyn={p_dyn:.3f}W, p_idle={p_idle:.3f}W). Widen the "
+                "profiled configuration space before scheduling for energy."
+            )
+            return
+
+        self._power_params = (p_dyn, p_idle)
+        print(
+            f"[MixedPerfModel:{self._model_name}] Power model fitted: "
+            f"P = {p_dyn:.3f}W per vcpu-worker + {p_idle:.3f}W static"
+        )
+
+    @property
+    def has_energy_model(self) -> bool:
+        return getattr(self, "_power_params", None) is not None
+
     def train(self, stage_profile_data: Dict) -> None:
+        # STEP 0: Fit the power model from measured energy, if present
+        self._fit_power_params(stage_profile_data)
+
         # STEP 1: Populate the data
         self._populate_data(stage_profile_data)
 
@@ -476,7 +567,14 @@ class MixedPerfModel(PerfModel, GetAndSet):
         config_list = "config_list"
         coeffs_list = "coeffs_list"
 
-        assert mode in ["latency", "cost"]
+        assert mode in ["latency", "cost", "energy"]
+
+        if mode == "energy" and not self.has_energy_model:
+            raise ValueError(
+                f"Stage '{self._model_name}' has no fitted power model, so an energy "
+                "expression cannot be generated. Re-profile this stage with an energy "
+                "monitor active over at least two configurations."
+            )
 
         stage_idx = int(self._stage_idx)
         cold_param = f"{coeffs_list}[{stage_idx}][cold]"
@@ -504,6 +602,18 @@ class MixedPerfModel(PerfModel, GetAndSet):
             code += f"{logx_param}*np.log({var_k})/{var_k} + {x2_param}/{var_k}**2 + {const_param}"
         if mode == "latency":
             code = f"{cold_param} + {code}"
+        elif mode == "energy":
+            # E = (p_dyn * k * d + p_idle) * T, with p_dyn/p_idle in watts
+            # fitted from measured energy in _fit_power_params. Cold start is
+            # included in T: the container is powered while it initialises, so
+            # excluding it would systematically under-report the energy of
+            # wide, short stages -- exactly the configurations the optimiser is
+            # deciding between.
+            p_dyn, p_idle = self._power_params
+            code = (
+                f"({cold_param} + {code}) * "
+                f"({p_dyn!r} * {var_k} * {var_d} + {p_idle!r})"
+            )
         else:
             # 1792 / 1024 * 0.0000000167 * 1000 = 0.000029225
             # 1000 is to convert from ms to s

@@ -15,6 +15,40 @@ def phase_func(x, a, b):
 coldstart_func = io_func = comp_func = phase_func
 
 
+def energy_func(x, a, b):
+    """
+    Energy against allocated resource x (= vcpu * memory * workers).
+
+    Deliberately affine rather than the 1/x shape used for the time phases.
+    Adding resources shortens a stage but does not reduce the work done, so
+    energy does not decay towards a floor the way latency does; it typically
+    rises, because more parallel capacity means more idle silicon powered for
+    the duration. Fitting energy with a latency-shaped curve would force the
+    optimiser to conclude that more workers are always more efficient, which
+    is the opposite of the effect being measured.
+    """
+    return a * x + b
+
+
+def _has_numeric(series) -> bool:
+    """True if a stored profile series contains at least one usable number."""
+    for run in series or []:
+        for value in run if isinstance(run, (list, tuple)) else [run]:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return True
+    return False
+
+
+def _numeric_values(series):
+    """Flatten a stored profile series, dropping None and non-numeric entries."""
+    out = []
+    for run in series or []:
+        for value in run if isinstance(run, (list, tuple)) else [run]:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                out.append(float(value))
+    return out
+
+
 class AnaPerfModel(PerfModel):
     """
     AnaPerfModel records the mean parameter value.
@@ -33,6 +67,8 @@ class AnaPerfModel(PerfModel):
         self._read_params = None
         self._comp_params = None
         self._cold_params = None
+        self._energy_params = None
+        self._has_energy = False
 
         self._profiling_results = None
 
@@ -56,10 +92,26 @@ class AnaPerfModel(PerfModel):
             )
         self._profiling_results = stage_profile_data
 
+        # `energy` is fitted only when every configuration actually carries it.
+        # Profiles recorded before energy collection existed are still valid
+        # for the latency and cost objectives; failing the whole training run
+        # for a missing energy series would throw away that data.
+        required = [k for k in FunctionTimes.profile_keys() if k != "energy"]
         for config_data in stage_profile_data.values():
             assert all(
-                key in config_data for key in FunctionTimes.profile_keys()
-            ), f"Each configuration's data must contain {FunctionTimes.profile_keys()} keys."
+                key in config_data for key in required
+            ), f"Each configuration's data must contain {required} keys."
+
+        self._has_energy = all(
+            "energy" in cd and _has_numeric(cd["energy"])
+            for cd in stage_profile_data.values()
+        )
+        if not self._has_energy:
+            print(
+                "[AnaPerfModel] No usable energy series in the profile; the energy "
+                "objective is unavailable for this stage. Re-profile with an "
+                "energy monitor active before scheduling for energy."
+            )
 
         # print(f"Training Analytical performance model for {self._stage_name}")
 
@@ -67,6 +119,7 @@ class AnaPerfModel(PerfModel):
         size2points_read = {}
         size2points_comp = {}
         size2points_write = {}
+        size2points_energy = {}
 
         for config_tuple, data in stage_profile_data.items():
             num_vcpu, memory, num_func = config_tuple
@@ -88,11 +141,29 @@ class AnaPerfModel(PerfModel):
                     size2points[config_key] = []
                 size2points[config_key].extend(data[phase])
 
+            if self._has_energy:
+                # Energy is aggregated differently from the time phases, and
+                # the difference is not incidental. A stage's latency is the
+                # time of its slowest worker, so averaging per-worker values is
+                # the right summary. A stage's energy is what all its workers
+                # consumed together, so it is the SUM across workers within a
+                # repetition, then averaged across repetitions. Averaging
+                # across workers instead would divide the stage's energy by the
+                # worker count and make energy look independent of parallelism
+                # -- erasing the very trade-off being optimised.
+                if config_key not in size2points_energy:
+                    size2points_energy[config_key] = []
+                for repetition in data["energy"]:
+                    values = _numeric_values([repetition])
+                    if values:
+                        size2points_energy[config_key].append(sum(values))
+
         for size2points in [
             size2points_coldstart,
             size2points_read,
             size2points_comp,
             size2points_write,
+            size2points_energy,
         ]:
             for config in size2points:
                 size2points[config] = np.mean(size2points[config])
@@ -127,6 +198,13 @@ class AnaPerfModel(PerfModel):
         self._read_params = fit_params(size2points_read, io_func)
         self._comp_params = fit_params(size2points_comp, comp_func)
         self._write_params = fit_params(size2points_write, io_func)
+        if self._has_energy and len(size2points_energy) >= 2:
+            self._energy_params = fit_params(size2points_energy, energy_func)
+        else:
+            # A single configuration cannot constrain a two-parameter fit. Leave
+            # the model unfitted rather than returning a curve through one point.
+            self._energy_params = None
+            self._has_energy = False
 
         # print(
         #     f"COLD START: alpha parameter = {self._cold_params[0]}, beta parameter = {self._cold_params[1]}"
@@ -185,10 +263,38 @@ class AnaPerfModel(PerfModel):
             f"Predicted time: {a} / {key} + {b} = {total_predicted_time} = {(a / key) + b}"
         )
 
+        # Energy is predicted only when it was actually fitted from measured
+        # data. There is deliberately no proxy fallback here: substituting
+        # something like `k * vcpu * workers * time` would return a number that
+        # looks like a prediction but carries no measurement, and downstream
+        # code cannot tell the two apart. `None` forces the caller to handle
+        # the absence explicitly.
+        predicted_energy = (
+            energy_func(key, *self._energy_params) if self._energy_params else None
+        )
+        if predicted_energy is not None:
+            print(f"Predicted energy: {predicted_energy:.4f} J at key={key}")
+
         return FunctionTimes(
             total=total_predicted_time,
             read=predicted_read_time,
             compute=predicted_comp_time,
             write=predicted_write_time,
             cold_start=predicted_cold_time,
+            energy=predicted_energy,
+            energy_source="fitted_from_profile" if predicted_energy is not None else "none",
         )
+
+    @property
+    def energy_parameters(self):
+        """
+        (a, b) of the fitted affine energy model, or None when unfitted.
+
+        Exposed so schedulers can allocate on measured energy coefficients
+        rather than re-deriving them from a single predicted point.
+        """
+        return tuple(self._energy_params) if self._energy_params else None
+
+    @property
+    def has_energy_model(self) -> bool:
+        return bool(self._energy_params)
