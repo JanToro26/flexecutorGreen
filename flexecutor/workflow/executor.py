@@ -71,13 +71,26 @@ class DAGExecutor:
         config_key = resource_config.key
         if config_key not in profile_data:
             profile_data[config_key] = {}
-        for key in FunctionTimes.profile_keys():
+
+        # Fittable series, per-mechanism energy series, and provenance are all
+        # persisted. The last two are not fitted, but without them a stored
+        # profile cannot be audited afterwards: there would be no way to tell
+        # a RAPL-backed run from one that fell back to the modelled estimate
+        # on a host whose TDP never resolved.
+        all_keys = (
+            FunctionTimes.profile_keys()
+            + FunctionTimes.energy_keys()
+            + FunctionTimes.metadata_keys()
+        )
+        for key in all_keys:
             if key not in profile_data[config_key]:
                 profile_data[config_key][key] = []
             profile_data[config_key][key].append([])
         for profiling in new_profile_data:
-            for key in FunctionTimes.profile_keys():
-                profile_data[config_key][key][-1].append(getattr(profiling, key))
+            for key in all_keys:
+                profile_data[config_key][key][-1].append(
+                    getattr(profiling, key, None)
+                )
         print(f"Profile data: {profile_data}")
 
     def profile(
