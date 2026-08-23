@@ -2,9 +2,9 @@ from typing import Dict
 
 import numpy as np
 
-from modelling.perfmodel import PerfModel
-from utils.dataclass import StageConfig, FunctionTimes
-from workflow.stage import Stage
+from flexecutor.modelling.perfmodel import PerfModel
+from flexecutor.utils.dataclass import StageConfig, FunctionTimes
+from flexecutor.workflow.stage import Stage
 
 
 class Distribution:

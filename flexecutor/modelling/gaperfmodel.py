@@ -12,7 +12,10 @@ from scipy.optimize import differential_evolution
 
 from flexecutor.modelling.perfmodel import PerfModel
 from flexecutor.utils.dataclass import FunctionTimes, ConfigBounds, StageConfig
-from workflow.stage import Stage
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from flexecutor.workflow.stage import Stage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
