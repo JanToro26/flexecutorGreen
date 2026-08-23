@@ -18,9 +18,9 @@ lithops:
     log_level: INFO
 
 localhost:
-    runtime: python3
+    # runtime: python3
     # Windows: point at the venv interpreter instead, e.g.
-    # runtime: C:/Users/janto/Documents/TFG/Code/flexecutorGreen/.venv/Scripts/python.exe
+    runtime: C:/Users/janto/Documents/TFG/Code/flexecutorGreen/.venv/Scripts/python.exe
 
     # Must be at least the largest worker count swept, otherwise invocations
     # serialise and the parallelism being profiled is not what ran. Keep it at

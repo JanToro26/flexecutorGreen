@@ -17,6 +17,7 @@ install_requires = [
 extras_require = {
     "examples": [
         "S3path",
+        "scikit-learn",
     ],
     "drawing": [
         "matplotlib",
