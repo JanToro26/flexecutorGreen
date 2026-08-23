@@ -210,8 +210,6 @@ class Ditto(Scheduler):
         #   a < -tol  the fit says energy falls as resources grow, which is
         #             physically possible but far more often means the profile
         #             does not constrain the fit
-        ENERGY_SLOPE_TOL = 1e-9
-        #FLAT_WEIGHT = 1.0 / 1e-6 ABANDONED CODE
  
                 # Pass 1: stages whose energy genuinely grows with parallelism. Their
         # share is 1/a_s, so the steeper the stage, the less it gets.
