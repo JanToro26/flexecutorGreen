@@ -12,7 +12,7 @@ import time
 from flexecutor.utils.dataclass import StageConfig
 from flexecutor.workflow.executor import DAGExecutor
 
-from examples.energy_apps.dags import APPS, SERIAL_STAGES
+from examples.energy_apps.dags import APPS, SERIAL_STAGES, apply_pinning
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ def profile_app(
 
     dag, params_fn = APPS[app]()
     serial = SERIAL_STAGES[app]
+    apply_pinning(app, dag)
     executor = DAGExecutor(dag)
 
     total = len(workers) * len(memory) * len(cpu)

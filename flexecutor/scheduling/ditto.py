@@ -227,7 +227,7 @@ class Ditto(Scheduler):
         # share is 1/a_s, so the steeper the stage, the less it gets.
         weights = {}
         flat_stages = []
-        for stage in self._dag.stages:
+        for stage in schedulable:
             a, _ = stage.perf_model.energy_parameters
             if a > ENERGY_SLOPE_TOL:
                 weights[stage.stage_id] = 1.0 / a
@@ -366,10 +366,20 @@ class Ditto(Scheduler):
 
         num_workers_dict = {}
         for stage in self._dag.stages:
-            num_workers = round(
-                self.total_parallelism * self.parallelism_ratios[stage.stage_id]
-            )
-            num_workers = 1 if num_workers == 0 else num_workers
+            ratio = self.parallelism_ratios.get(stage.stage_id)
+            if ratio is None:
+                # No share was allocated to this stage. Two situations
+                # produce this, and both are handled the same way. A pinned
+                # stage runs at one worker by construction and is
+                # deliberately excluded from the split by
+                # _schedule_for_energy. A stage missed by the virtual-DAG
+                # walk in _schedule_for_latency would also land here, in
+                # which case falling back is safer than raising a KeyError
+                # from inside the scheduler.
+                num_workers = 1
+            else:
+                num_workers = round(self.total_parallelism * ratio)
+                num_workers = 1 if num_workers == 0 else num_workers
             num_workers_dict[stage.stage_id] = num_workers
 
         resource_config_list = []

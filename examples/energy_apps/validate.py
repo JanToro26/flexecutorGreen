@@ -16,7 +16,7 @@ from flexecutor.utils.dataclass import StageConfig
 from flexecutor.utils.utils import load_profiling_results
 from flexecutor.workflow.executor import AssetType, DAGExecutor, get_asset_path
 
-from examples.energy_apps.dags import APPS, SERIAL_STAGES
+from examples.energy_apps.dags import APPS, SERIAL_STAGES, apply_pinning
 from examples.energy_apps.harness import _apply_params
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,7 @@ def cross_validate(app: str) -> List[dict]:
         raise ValueError(f"Unknown app {app!r}; expected one of {sorted(APPS)}")
 
     dag, _ = APPS[app]()
+    apply_pinning(app, dag)
     executor = DAGExecutor(dag)
     rows: List[dict] = []
 
@@ -168,6 +169,7 @@ def validate_against_run(
 
     dag, params_fn = APPS[app]()
     serial = SERIAL_STAGES[app]
+    apply_pinning(app, dag)
     executor = DAGExecutor(dag)
     rows: List[dict] = []
 
@@ -177,6 +179,21 @@ def validate_against_run(
             path = get_asset_path(executor._base_path, dag, stage, AssetType.PROFILE)
             profile = load_profiling_results(path)
             if len(profile) < 2:
+                if getattr(stage, "pinned", False):
+                    # Pinned to one worker by construction, so a single
+                    # profile key is correct and there is nothing to fit.
+                    # The stage still executes, because downstream stages
+                    # depend on it; it is only excluded from the
+                    # comparison. leave_one_config_out treats it the same
+                    # way.
+                    logger.info(
+                        "[%s/%s] pinned, %d profiled configuration(s); "
+                        "excluded from the comparison.",
+                        app, stage.stage_id, len(profile),
+                    )
+                    continue
+                # Not pinned, so this really is missing data rather than a
+                # design decision, and it should stop the run.
                 raise RuntimeError(
                     f"[{app}/{stage.stage_id}] needs at least 2 profiled "
                     f"configurations, found {len(profile)}. Run the harness first."
@@ -201,6 +218,11 @@ def validate_against_run(
         wall = time.time() - t0
 
         for stage in dag.stages:
+            if stage.stage_id not in predictions:
+                # No model was fitted for this stage, so there is nothing
+                # to compare against. It still executed, because downstream
+                # stages depend on it.
+                continue
             future = futures.get(stage.stage_id)
             if future is None or future.error():
                 logger.error("[%s/%s] execution failed", app, stage.stage_id)
