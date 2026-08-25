@@ -191,10 +191,22 @@ class Ditto(Scheduler):
         resulting allocation would be indistinguishable from a real one in the
         output.
         """
+        # A pinned stage runs at one worker by construction, so it has no share
+        # of the parallelism budget to receive and a missing energy model costs
+        # nothing. Only a stage that could have been widened but has no model is
+        # a genuine gap.
+        schedulable = [s for s in self._dag.stages
+                       if not getattr(s, "pinned", False)]
+
+        if not schedulable:
+            raise ValueError(
+                "Cannot schedule for energy: every stage is pinned, so there is "
+                "no parallelism allocation to make."
+            )
+
         unfitted = [
-            stage.stage_id
-            for stage in self._dag.stages
-            if not getattr(stage.perf_model, "has_energy_model", False)
+            s.stage_id for s in schedulable
+            if not getattr(s.perf_model, "has_energy_model", False)
         ]
         if unfitted:
             raise ValueError(

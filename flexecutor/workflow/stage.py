@@ -27,7 +27,6 @@ class Stage:
     :param stage_id: Stage ID
     :param inputs: List of InputS3Path instances for the operator
     """
-
     def __init__(
         self,
         stage_id: str,
@@ -56,6 +55,10 @@ class Stage:
         self._resource_config: Optional[StageConfig] = StageConfig(
             cpu=1, memory=2048, workers=1
         )
+        # True when this stage is fixed to one worker by construction, so there
+        # is no parallelism decision for a scheduler to make. Distinct from a
+        # stage whose model simply failed to fit.
+        self.pinned = False
 
     def __repr__(self) -> str:
         return f"Stage({self._stage_id}, resource_config={self.resource_config}) "

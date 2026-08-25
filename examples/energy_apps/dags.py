@@ -113,3 +113,9 @@ SERIAL_STAGES = {
     "montecarlo": set(),
     "titanic": set(),
 }
+
+def apply_pinning(app: str, dag) -> None:
+    """Mark serial stages so schedulers know they have no parallelism decision."""
+    serial = SERIAL_STAGES[app]
+    for stage in dag.stages:
+        stage.pinned = stage.stage_id in serial
