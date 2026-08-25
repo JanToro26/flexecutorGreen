@@ -33,8 +33,43 @@ from examples.energy_apps.validate import (  # noqa: E402
     validate_against_run,
 )
 
+def _resolve_config():
+    """
+    Point Lithops at the repo config unless the caller overrode it, then verify
+    the runtime interpreter exists.
+
+    Without this, an unset LITHOPS_CONFIG_FILE makes Lithops fall back to
+    `runtime: python.exe`, which does not resolve from the worker's working
+    directory. Every worker then dies at exec with no log, and the localhost
+    backend waits on results that never arrive.
+    """
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    if not os.environ.get("LITHOPS_CONFIG_FILE"):
+        default = os.path.join(root, "config", "localhost_sudo.yaml")
+        if not os.path.exists(default):
+            sys.exit(f"No LITHOPS_CONFIG_FILE set and {default} does not exist.")
+        os.environ["LITHOPS_CONFIG_FILE"] = default
+        print(f"[config] using {default}")
+
+    import lithops.config
+    cfg = lithops.config.default_config()
+    backend = cfg["lithops"]["backend"]
+    if backend != "localhost":
+        return
+
+    runtime = cfg.get("localhost", {}).get("runtime", "")
+    if os.path.sep in runtime or "/" in runtime:
+        if not os.path.exists(runtime):
+            sys.exit(
+                f"Configured runtime does not exist: {runtime}\n"
+                f"Config: {os.environ['LITHOPS_CONFIG_FILE']}\n"
+                "Workers would fail at exec with no log. Fix the path first."
+            )
+        print(f"[config] runtime ok: {runtime}")
 
 def main() -> None:
+    _resolve_config()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["profile", "validate", "holdout"])
