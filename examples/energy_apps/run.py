@@ -4,7 +4,7 @@
     python examples/energy_apps/run.py profile
     python examples/energy_apps/run.py profile --apps video --workers 1 2 4 8 --reps 5
     python examples/energy_apps/run.py validate --apps ml
-    python examples/energy_apps/run.py holdout --apps video --workers 6
+    python examples/energy_apps/run.py holdout --apps video --workers 6 --reps 5
 
 Run from the repository root.
 """
@@ -78,6 +78,8 @@ def main() -> None:
     ap.add_argument("--workers", nargs="*", type=int, default=list(DEFAULT_WORKERS))
     ap.add_argument("--memory", nargs="*", type=float, default=list(DEFAULT_MEMORY))
     ap.add_argument("--cpu", nargs="*", type=float, default=list(DEFAULT_CPU))
+    # Also used by holdout: it must repeat as many times as the profile did,
+    # otherwise the single measurement is biased against the profiled mean.
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--bucket", default="")
     ap.add_argument("--log", default="INFO")
@@ -114,6 +116,7 @@ def main() -> None:
                         workers=args.workers[0],
                         cpu=args.cpu[0],
                         memory=args.memory[0],
+                        num_reps=args.reps,
                     ),
                     title="PREDICTED vs MEASURED",
                 )

@@ -158,6 +158,7 @@ def validate_against_run(
     workers: int,
     cpu: float = 1,
     memory: float = 1024,
+    num_reps: int = 1,
 ) -> List[dict]:
     """Train on the stored profile, predict this configuration, run it, compare.
 
@@ -213,9 +214,31 @@ def validate_against_run(
                 workers=1 if stage.stage_id in serial else workers,
             )
 
+        # Repeat under the same conditions as profiling, then average.
+        per_rep: Dict[str, List[tuple]] = {s.stage_id: [] for s in dag.stages}
         t0 = time.time()
-        futures = executor.execute()
-        wall = time.time() - t0
+        for rep in range(num_reps):
+            futures = executor.execute()
+            for stage in dag.stages:
+                future = futures.get(stage.stage_id)
+                if future is None or future.error():
+                    logger.error(
+                        "[%s/%s] execution failed on repetition %d",
+                        app, stage.stage_id, rep + 1,
+                    )
+                    continue
+                timings = future.get_timings()
+                if not timings:
+                    continue
+                energies = [t.energy for t in timings if t.energy is not None]
+                e = sum(energies) if energies else None
+                t = sum(
+                    sum(getattr(x, ph, 0.0) or 0.0 for x in timings) / len(timings)
+                    for ph in TIME_PHASES
+                )
+                srcs = {x.energy_source for x in timings if x.energy_source}
+                per_rep[stage.stage_id].append((e, t, srcs))
+        wall = (time.time() - t0) / max(num_reps, 1)
 
         for stage in dag.stages:
             if stage.stage_id not in predictions:
@@ -223,21 +246,18 @@ def validate_against_run(
                 # to compare against. It still executed, because downstream
                 # stages depend on it.
                 continue
-            future = futures.get(stage.stage_id)
-            if future is None or future.error():
-                logger.error("[%s/%s] execution failed", app, stage.stage_id)
+            reps = per_rep.get(stage.stage_id) or []
+            if not reps:
+                logger.error("[%s/%s] no successful repetition", app, stage.stage_id)
                 continue
 
-            timings = future.get_timings()
-            energies = [t.energy for t in timings if t.energy is not None]
-            measured_energy = sum(energies) if energies else None
-            measured_time = sum(
-                sum(getattr(t, p, 0.0) or 0.0 for t in timings) / len(timings)
-                for p in TIME_PHASES
-            ) if timings else None
+            e_vals = [e for e, _, _ in reps if e is not None]
+            measured_energy = sum(e_vals) / len(e_vals) if e_vals else None
+            t_vals = [t for _, t, _ in reps if t is not None]
+            measured_time = sum(t_vals) / len(t_vals) if t_vals else None
 
             predicted = predictions[stage.stage_id]
-            sources = {t.energy_source for t in timings if t.energy_source}
+            sources = set().union(*(s for _, _, s in reps)) if reps else set()
 
             rows.append({
                 "app": app,
@@ -253,6 +273,7 @@ def validate_against_run(
                 "time_err_pct": _pct_err(predicted.total, measured_time),
                 "energy_source": "/".join(sorted(sources)) if sources else "none",
                 "wall_s": round(wall, 3),
+                "num_reps": num_reps,
             })
     finally:
         executor.shutdown()
@@ -285,7 +306,9 @@ def print_report(rows: List[dict], title: str = "VALIDATION") -> None:
     headers = ["Stage", "W", "E_pred(J)", "E_meas(J)", "E_err%",
                "t_pred(s)", "t_meas(s)", "t_err%", "source"]
 
-    print(f"\n=== {title} : {rows[0]['app']} ===")
+    reps = rows[0].get("num_reps")
+    suffix = f" ({reps} reps)" if reps else ""
+    print(f"\n=== {title} : {rows[0]['app']}{suffix} ===")
     if tabulate:
         print(tabulate(table, headers=headers, tablefmt="fancy_grid"))
     else:
