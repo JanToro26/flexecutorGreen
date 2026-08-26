@@ -119,18 +119,24 @@ def ml_stage3_test(ctx):
 # Video pipeline: stage2 dominates; stage0 does not benefit from parallelism.
 # ---------------------------------------------------------------------------
 
-TOTAL_FRAMES = 240
+# Sized so the stages stay long enough to be measurable: the psutil monitor
+# samples process CPU every 0.5s, so a stage under about 2.5s gets fewer than
+# five samples and its utilisation figure is not a measurement.
+TOTAL_FRAMES = 1200
 FRAME_H = 240
 FRAME_W = 320
 
 
 def _frames(seed, count):
+    """Yield frames one at a time. rng.normal returns float64, so batching the
+    whole segment allocated ~2.2GB at 1200 frames before the cast to uint8."""
     import numpy as np
 
     rng = np.random.default_rng(seed)
-    return np.clip(
-        rng.normal(128, 40, size=(count, FRAME_H, FRAME_W, 3)), 0, 255
-    ).astype("uint8")
+    for _ in range(count):
+        yield np.clip(
+            rng.normal(128, 40, size=(FRAME_H, FRAME_W, 3)), 0, 255
+        ).astype("uint8")
 
 
 def video_stage0_segment(ctx):
@@ -145,7 +151,7 @@ def video_stage1_extract(ctx):
     """Decode this worker's segment into frames."""
     seed = ctx.get_param("seed")
     count = ctx.get_param("frames_per_worker")
-    return int(_frames(seed, count).shape[0])
+    return sum(1 for _ in _frames(seed, count))
 
 
 def video_stage2_enhance(ctx):
@@ -172,10 +178,16 @@ def video_stage3_analyze(ctx):
 
     seed = ctx.get_param("seed")
     count = ctx.get_param("frames_per_worker")
-    frames = _frames(seed, count)
+    n = 0
+    brightness_sum = 0.0
     edges = 0.0
-    for fr in frames:
+    for fr in _frames(seed, count):
+        n += 1
+        brightness_sum += float(fr.mean())
         gray = fr.mean(axis=2)
         edges += float(np.abs(np.diff(gray, axis=1)).mean()
                        + np.abs(np.diff(gray, axis=0)).mean())
-    return {"brightness": float(frames.mean()), "edges": edges / max(len(frames), 1)}
+    # Frames are all the same size, so the mean of the per-frame means is the
+    # overall mean.
+    return {"brightness": brightness_sum / n if n else 0.0,
+            "edges": edges / n if n else 0.0}
