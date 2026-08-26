@@ -63,7 +63,32 @@ class ThreadPoolProcessor:
             stage_id: ex_future.result() for stage_id, ex_future in ex_futures.items()
         }
 
+    @staticmethod
+    def _retire_executor(executor) -> None:
+        """Stop a finished executor's job monitor, then drop its temporary data.
+
+        clean() only removes temporary data. The storage job monitor is a
+        separate thread that keeps polling until stop() is called, so without
+        this every stage invocation leaks one polling thread and a long sweep
+        progressively loads the machine it is measuring.
+        """
+        if executor is None:
+            return
+        monitor = getattr(executor, "job_monitor", None)
+        if monitor is not None:
+            try:
+                monitor.stop()
+            except Exception:
+                logger.debug("Could not stop job monitor", exc_info=True)
+        try:
+            executor.clean()
+        except Exception:
+            logger.debug("Could not clean executor", exc_info=True)
+
     def shutdown(self):
+        # The last executor is not retired by _process_stage, so do it here.
+        self._retire_executor(self._executor)
+        self._executor = None
         self._pool.shutdown()
 
     def _process_stage(
@@ -97,8 +122,7 @@ class ThreadPoolProcessor:
             )
             map_iterdata.append(ctx)
 
-        if self._executor:
-            self._executor.clean()
+        self._retire_executor(self._executor)
 
         self._executor = FunctionExecutor(
             log_level=self.log_level, **{"runtime_cpu": stage.resource_config.cpu}
