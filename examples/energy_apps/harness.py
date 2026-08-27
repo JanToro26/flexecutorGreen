@@ -16,7 +16,7 @@ from examples.energy_apps.dags import APPS, SERIAL_STAGES, apply_pinning
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WORKERS = (1, 2, 4, 8)
+DEFAULT_WORKERS = (1, 2, 3, 4, 5, 6)
 # Memory only varies the measurement on a backend that enforces it (Lambda, or
 # k8s with limits). On localhost extra values just duplicate profile keys.
 DEFAULT_MEMORY = (1024,)
