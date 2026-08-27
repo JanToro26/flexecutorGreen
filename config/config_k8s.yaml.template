@@ -1,0 +1,25 @@
+# Kubernetes (rack) backend + S3-compatible storage.
+# Copy to config/config_k8s.yaml (gitignored) and fill placeholders.
+#
+#   LITHOPS_CONFIG_FILE=config/config_k8s.yaml python examples/energy_apps/run.py profile
+#
+# Energy comes from RAPL (real joules) — requires the pod-spec patch that
+# mounts /sys/class/powercap and runs workers privileged. After a profile,
+# check the stats: rapl_pkg_files must be non-empty, else it fell back to psutil.
+
+lithops:
+    backend: k8s
+    storage: minio
+k8s:
+    docker_server: docker.io
+    docker_user: YOUR_DOCKERHUB_USER
+    docker_password: YOUR_DOCKERHUB_TOKEN
+    runtime: YOUR_DOCKERHUB_USER/lithops-k8s-rapl:v1
+    runtime_cpu: 1
+    runtime_memory: 1024
+    max_workers: 40
+minio:
+    endpoint: ENDPOINT
+    access_key_id: ACCESS_KEY_ID
+    secret_access_key: SECRET_ACCESS_KEY
+    storage_bucket: STORAGE_BUCKET

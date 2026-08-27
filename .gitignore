@@ -135,3 +135,6 @@ examples/*/profiling/
 # vscode, formatting...
 .vscode/
 .flake8
+
+# Remote backend config
+config_*.yaml
