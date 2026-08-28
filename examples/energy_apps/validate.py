@@ -15,6 +15,7 @@ from flexecutor.modelling.perfmodel import PerfModelEnum
 from flexecutor.utils.dataclass import StageConfig
 from flexecutor.utils.utils import load_profiling_results
 from flexecutor.workflow.executor import AssetType, DAGExecutor, get_asset_path
+from flexecutor.modelling.energy_agg import stage_energy
 
 from examples.energy_apps.dags import APPS, SERIAL_STAGES, apply_pinning
 from examples.energy_apps.harness import _apply_params
@@ -52,19 +53,24 @@ def _flatten_str(values) -> List[str]:
 
 
 def _measured_energy(config_data: dict) -> Optional[float]:
-    """Mean over repetitions of the per-repetition sum across workers.
+    """Mean over repetitions of the per-repetition stage energy.
 
-    Matches how AnaPerfModel.train aggregates energy, so the comparison
-    measures model error and not an aggregation difference.
+    Uses the same combiner as AnaPerfModel.train, so the comparison measures
+    model error and not an aggregation difference.
     """
     runs = config_data.get("energy")
     if not runs:
         return None
+    source_runs = config_data.get("energy_source") or []
     per_rep = []
-    for repetition in runs:
+    for i, repetition in enumerate(runs):
         vals = _numeric([repetition])
-        if vals:
-            per_rep.append(sum(vals))
+        if not vals:
+            continue
+        srcs = source_runs[i] if i < len(source_runs) else []
+        if not isinstance(srcs, (list, tuple)):
+            srcs = [srcs]
+        per_rep.append(stage_energy(vals, srcs))
     return sum(per_rep) / len(per_rep) if per_rep else None
 
 
@@ -164,6 +170,10 @@ def validate_against_run(
 
     Use a configuration that was not profiled, otherwise this only measures the
     fit residual.
+
+    num_reps must match the repetition count used when profiling. The harness
+    averages over repetitions, and this machine slows measurably within a run,
+    so a single execution here is systematically faster than a profiled mean.
     """
     if app not in APPS:
         raise ValueError(f"Unknown app {app!r}; expected one of {sorted(APPS)}")
@@ -231,7 +241,10 @@ def validate_against_run(
                 if not timings:
                     continue
                 energies = [t.energy for t in timings if t.energy is not None]
-                e = sum(energies) if energies else None
+                # Combine per-worker energy the same way the profile path does,
+                # so holdout error measures the model and not an aggregation mismatch.
+                e_srcs = [t.energy_source for t in timings if t.energy_source]
+                e = stage_energy(energies, e_srcs) if energies else None
                 t = sum(
                     sum(getattr(x, ph, 0.0) or 0.0 for x in timings) / len(timings)
                     for ph in TIME_PHASES
