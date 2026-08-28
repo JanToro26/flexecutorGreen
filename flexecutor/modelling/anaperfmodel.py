@@ -13,7 +13,27 @@ def phase_func(x, a, b):
     return a / x + b
 
 
-coldstart_func = io_func = comp_func = phase_func
+io_func = comp_func = phase_func
+
+
+def coldstart_func(x, a, b):
+    """Cold start against allocated resource x (= vcpu * memory * workers).
+
+    Affine rather than the 1/x shape used for the working phases. Read,
+    compute and write are work divided among workers, so they shrink as
+    resources grow. Cold start is not divided: every worker pays its own
+    start-up, and workers contend for admission, so the stage waits longer
+    the more of them there are. On a single pinned node this is close to
+    linear -- measured 6 s at 1 worker rising to 268 s at 64, i.e. a roughly
+    constant per-worker cost.
+
+    Affine also covers the independent-provisioning case (AWS Lambda, where
+    workers start in parallel and the term is near-constant): the fit simply
+    returns a ~ 0 and the intercept carries it. A 1/x shape cannot represent
+    growth at all, so it forces the optimiser to treat start-up as free at
+    high worker counts.
+    """
+    return a * x + b
 
 
 def energy_func(x, a, b):
