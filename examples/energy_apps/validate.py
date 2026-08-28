@@ -340,7 +340,7 @@ def print_report(rows: List[dict], title: str = "VALIDATION") -> None:
 
     if any("rapl" in (r["energy_source"] or "") for r in rows):
         print(
-            "  NOTE: RAPL values are whole-package counters and the training "
-            "path sums them across workers, so these figures scale with the "
-            "worker count."
+            "  NOTE: RAPL values are whole-machine package counters, so one "
+            "representative reading (max across workers) is the stage energy, "
+            "not the sum. All workers must share one node for this to hold."
         )
