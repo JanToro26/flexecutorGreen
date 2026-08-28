@@ -6,7 +6,7 @@ from overrides import overrides
 
 from flexecutor.modelling.perfmodel import PerfModel
 from flexecutor.utils.dataclass import FunctionTimes, StageConfig, ConfigBounds
-from flexecutor.modelling.energy_agg import stage_energy
+from flexecutor.modelling.energy_agg import stage_energy, _is_shared_meter
 
 
 def phase_func(x, a, b):
@@ -29,6 +29,14 @@ def energy_func(x, a, b):
     is the opposite of the effect being measured.
     """
     return a * x + b
+
+def energy_func_shared(x, a, b):
+    """Energy against allocated resource x, for a shared whole-machine meter.
+
+    With one package counter per node (k8s RAPL, workers pinned to one node),
+    measured energy is node power times the elapsed window.
+    """
+    return a / x + b
 
 
 def _has_numeric(series) -> bool:
@@ -70,6 +78,9 @@ class AnaPerfModel(PerfModel):
         self._cold_params = None
         self._energy_params = None
         self._has_energy = False
+        # True when the profile came from one shared whole-machine meter
+        # (k8s RAPL).
+        self._energy_shared_meter = False
 
         self._profiling_results = None
 
@@ -102,6 +113,8 @@ class AnaPerfModel(PerfModel):
             assert all(
                 key in config_data for key in required
             ), f"Each configuration's data must contain {required} keys."
+
+        self._energy_shared_meter = False
 
         self._has_energy = all(
             "energy" in cd and _has_numeric(cd["energy"])
@@ -153,6 +166,8 @@ class AnaPerfModel(PerfModel):
                     srcs = source_runs[i] if i < len(source_runs) else []
                     if not isinstance(srcs, (list, tuple)):
                         srcs = [srcs]
+                    if _is_shared_meter(srcs):
+                        self._energy_shared_meter = True
                     size2points_energy[config_key].append(stage_energy(values, srcs))
 
         for size2points in [
@@ -196,7 +211,7 @@ class AnaPerfModel(PerfModel):
         self._comp_params = fit_params(size2points_comp, comp_func)
         self._write_params = fit_params(size2points_write, io_func)
         if self._has_energy and len(size2points_energy) >= 2:
-            self._energy_params = fit_params(size2points_energy, energy_func)
+            self._energy_params = fit_params(size2points_energy, self._energy_curve)
         else:
             # A single configuration cannot constrain a two-parameter fit. Leave
             # the model unfitted rather than returning a curve through one point.
@@ -267,7 +282,9 @@ class AnaPerfModel(PerfModel):
         # code cannot tell the two apart. `None` forces the caller to handle
         # the absence explicitly.
         predicted_energy = (
-            energy_func(key, *self._energy_params) if self._energy_params else None
+            self._energy_curve(key, *self._energy_params)
+            if self._energy_params
+            else None
         )
         if predicted_energy is not None:
             print(f"Predicted energy: {predicted_energy:.4f} J at key={key}")
@@ -281,6 +298,18 @@ class AnaPerfModel(PerfModel):
             energy=predicted_energy,
             energy_source="fitted_from_profile" if predicted_energy is not None else "none",
         )
+
+    def _energy_curve(self, x, a, b):
+        """The energy curve whose shape matches the meter behind the profile.
+
+        Independent per-worker meters -> affine rise (energy_func). One shared
+        whole-machine meter -> decay towards an idle-power floor
+        (energy_func_shared). Fitting and prediction must use the same shape,
+        so both go through here.
+        """
+        if self._energy_shared_meter:
+            return energy_func_shared(x, a, b)
+        return energy_func(x, a, b)
 
     @property
     def energy_parameters(self):
