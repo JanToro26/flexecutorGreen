@@ -8,6 +8,7 @@ from overrides import overrides
 
 from flexecutor.modelling.perfmodel import PerfModel
 from flexecutor.utils.dataclass import StageConfig, FunctionTimes
+from flexecutor.modelling.energy_agg import stage_energy
 
 
 class ModelStrategy(ABC):
@@ -295,16 +296,22 @@ class MixedPerfModel(PerfModel, GetAndSet):
             if not energy_runs or not duration_runs:
                 continue
 
-            for e_run, d_run in zip(energy_runs, duration_runs):
+            source_runs = data.get("energy_source") or []
+            for idx, (e_run, d_run) in enumerate(zip(energy_runs, duration_runs)):
                 e_vals = [v for v in (e_run or []) if isinstance(v, (int, float))
                           and not isinstance(v, bool)]
                 d_vals = [v for v in (d_run or []) if isinstance(v, (int, float))
                           and not isinstance(v, bool)]
                 if not e_vals or not d_vals:
                     continue
-                # Stage energy is the sum over workers; stage duration is the
-                # slowest worker, because workers run concurrently.
-                stage_energy = float(sum(e_vals))
+                srcs = source_runs[idx] if idx < len(source_runs) else []
+                if not isinstance(srcs, (list, tuple)):
+                    srcs = [srcs]
+                # Stage duration is the slowest worker, because workers run
+                # concurrently. Stage energy depends on what meter produced the
+                # readings -- SUM for independent per-worker meters, MAX for one
+                # shared whole-machine meter. See flexecutor.modelling.energy_agg.
+                stage_e = stage_energy(e_vals, srcs)
                 stage_duration = float(max(d_vals))
                 if stage_duration <= 0:
                     continue
@@ -312,7 +319,7 @@ class MixedPerfModel(PerfModel, GetAndSet):
                 d = float(workers) if self.allow_parallel else 1.0
                 # E = (p_dyn * k*d + p_idle) * T  ->  linear in (k*d*T, T)
                 rows_x.append([k * d * stage_duration, stage_duration])
-                rows_y.append(stage_energy)
+                rows_y.append(stage_e)
 
         if len(rows_x) < 2:
             print(

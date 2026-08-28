@@ -6,6 +6,7 @@ from overrides import overrides
 
 from flexecutor.modelling.perfmodel import PerfModel
 from flexecutor.utils.dataclass import FunctionTimes, StageConfig, ConfigBounds
+from flexecutor.modelling.energy_agg import stage_energy
 
 
 def phase_func(x, a, b):
@@ -142,21 +143,17 @@ class AnaPerfModel(PerfModel):
                 size2points[config_key].extend(data[phase])
 
             if self._has_energy:
-                # Energy is aggregated differently from the time phases, and
-                # the difference is not incidental. A stage's latency is the
-                # time of its slowest worker, so averaging per-worker values is
-                # the right summary. A stage's energy is what all its workers
-                # consumed together, so it is the SUM across workers within a
-                # repetition, then averaged across repetitions. Averaging
-                # across workers instead would divide the stage's energy by the
-                # worker count and make energy look independent of parallelism
-                # -- erasing the very trade-off being optimised.
                 if config_key not in size2points_energy:
                     size2points_energy[config_key] = []
-                for repetition in data["energy"]:
+                source_runs = data.get("energy_source") or []
+                for i, repetition in enumerate(data["energy"]):
                     values = _numeric_values([repetition])
-                    if values:
-                        size2points_energy[config_key].append(sum(values))
+                    if not values:
+                        continue
+                    srcs = source_runs[i] if i < len(source_runs) else []
+                    if not isinstance(srcs, (list, tuple)):
+                        srcs = [srcs]
+                    size2points_energy[config_key].append(stage_energy(values, srcs))
 
         for size2points in [
             size2points_coldstart,
