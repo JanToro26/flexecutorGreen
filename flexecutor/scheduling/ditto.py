@@ -162,6 +162,10 @@ class Ditto(Scheduler):
         param_a_dict = {}
         # Assume each function under Ditto has the same memory size
         for stage in self._dag.stages:
+            if getattr(stage, "pinned", False):
+                # No share of the budget, and no trained model to read
+                # from. schedule() maps a missing ratio to one worker.
+                continue
             param_a, _ = stage.perf_model.parameters
             param_a = math.sqrt(abs(param_a))
             param_a_dict[stage.stage_id] = param_a
@@ -252,6 +256,15 @@ class Ditto(Scheduler):
         self.parallelism_ratios = {k: v / total for k, v in weights.items()}
 
     def _schedule_for_latency(self):
+        pinned = [s.stage_id for s in self._dag.stages
+                  if getattr(s, "pinned", False)]
+        if pinned:
+            raise ValueError(
+                f"objective='latency' does not support pinned stages {pinned}: "
+                "the virtual-DAG merge divides by param_a, which a pinned stage "
+                "does not have."
+            )
+
         if len(self.leafs) != 1:
             raise ValueError("Do not support the current virtual DAG in Ditto")
         sink_stage = self.leafs[0]
@@ -306,9 +319,16 @@ class Ditto(Scheduler):
 
     def schedule(self):
         for stage in self._dag.stages:
-            param_a, _ = stage.perf_model.parameters
-            # Fit for not allow_parallel stages, whose "a" is negative
-            param_a = abs(param_a)
+            if getattr(stage, "pinned", False):
+                # A pinned stage takes no share of the budget and cannot be
+                # trained: it profiles at one worker, and AnaPerfModel.train
+                # requires two configurations. It still enters the virtual DAG
+                # so the topology stays whole.
+                param_a = 0.0
+            else:
+                param_a, _ = stage.perf_model.parameters
+                # Fit for not allow_parallel stages, whose "a" is negative
+                param_a = abs(param_a)
             new_stage = VirtualStage(param_a, stage.stage_id)
             self.virtual_stages[stage.stage_id] = new_stage
             if stage in self._dag.root_stages:
