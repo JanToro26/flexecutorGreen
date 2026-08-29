@@ -172,6 +172,7 @@ class DAGExecutor:
 
         logger.info("Profiling completed for all configurations")
 
+    # Unused, validate.py actually uses method called predict_time defined in models
     def predict(
         self, resource_config: List[StageConfig], stage: Optional[Stage] = None
     ) -> List[FunctionTimes]:
