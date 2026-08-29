@@ -333,14 +333,43 @@ class AnaPerfModel(PerfModel):
 
     @property
     def energy_parameters(self):
-        """
-        (a, b) of the fitted affine energy model, or None when unfitted.
+        """Raw (a, b) of the fitted curve, or None if unfitted.
 
-        Exposed so schedulers can allocate on measured energy coefficients
-        rather than re-deriving them from a single predicted point.
+        a is a slope only for the affine shape; for E = a/x + b it is a
+        numerator. Use energy_marginal() if you want a slope.
         """
         return tuple(self._energy_params) if self._energy_params else None
+    
+    def _profiled_x(self):
+        """The x values this stage was actually profiled at, ascending."""
+        if not self._profiling_results:
+            return []
+        xs = []
+        for cpu, memory, workers in self._profiling_results:
+            vcpu = cpu if self.allow_parallel else 1
+            xs.append(self._config_to_xparam(vcpu, memory, workers))
+        return sorted(xs)
 
+    def energy_marginal(self, x=None):
+        """dE/dx at x -- what one more unit of resource costs in energy.
+
+        For the affine shape a is already the slope; for the shared-meter shape
+        E = a/x + b it is -a/x^2, so reading a directly flips the sign on RAPL
+        profiles. x defaults to the median profiled configuration. None when
+        the model is unfitted.
+        """
+        if not self._energy_params:
+            return None
+        if x is None:
+            xs = self._profiled_x()
+            if not xs:
+                return None
+            x = xs[len(xs) // 2]
+        a = self._energy_params[0]
+        if self._energy_shared_meter:
+            return -a / (x * x)
+        return a
+    
     @property
     def has_energy_model(self) -> bool:
         return bool(self._energy_params)

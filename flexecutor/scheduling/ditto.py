@@ -170,26 +170,17 @@ class Ditto(Scheduler):
 
     def _schedule_for_energy(self):
         """
-        Distribute the parallelism budget across stages by measured energy
-        sensitivity.
+        Split the parallelism budget by each stage's energy slope.
 
-        Each stage has a fitted affine energy model E_s(x) = a_s * x + b_s over
-        the allocated resource x, where a_s is how much extra energy that stage
-        pays for each extra unit of parallelism (see
-        ``AnaPerfModel.energy_parameters``). To minimise total energy under a
-        fixed parallelism budget, give parallelism to the stages that are cheap
-        to parallelise and withhold it from the expensive ones, so the share of
-        stage s is proportional to 1 / a_s.
+        The slope is dE/dx from AnaPerfModel.energy_marginal, not the raw
+        coefficient a -- a is a slope only for the affine shape; for
+        E = a/x + b it is -a/x^2. Each stage's share is 1/m, so the cheaper a
+        stage is to widen, the more it gets. |m| within tol counts as flat and
+        gets flat_stage_boost; m below -tol is reported and also treated as
+        flat.
 
-        
-        A stage with a > tol gets 1/a. |a| <= tol is flat and gets flat_stage_boost
-        times the largest real weight; a < -tol is reported and treated as flat.
-
-        This refuses to run without fitted energy models instead of falling
-        back to a time-based proxy. A proxy would silently turn "scheduled for
-        energy" into "scheduled for latency under a different name", and the
-        resulting allocation would be indistinguishable from a real one in the
-        output.
+        Raises if any stage lacks an energy model, rather than falling back to
+        a time proxy and calling the result energy scheduling.
         """
         # A pinned stage runs at one worker by construction, so it has no share
         # of the parallelism budget to receive and a missing energy model costs
@@ -215,28 +206,31 @@ class Ditto(Scheduler):
                 "(at least two configurations) before using objective='energy'."
             )
 
-        # a_s is the marginal energy cost of one more unit of parallelism.
-        # Three cases, and they are not the same case:
-        #   a > tol   the stage pays for parallelism; weight it by 1/a
-        #   |a| <= tol  energy is flat in parallelism; the stage is free to widen
-        #   a < -tol  the fit says energy falls as resources grow, which is
-        #             physically possible but far more often means the profile
-        #             does not constrain the fit
- 
-                # Pass 1: stages whose energy genuinely grows with parallelism. Their
-        # share is 1/a_s, so the steeper the stage, the less it gets.
+        # Weight by dE/dx, not the raw coefficient a: for the shared-meter
+        # shape E = a/x + b the slope is -a/x^2, so a positive a means energy
+        # falls. Three distinct cases:
+        #   m > tol     stage pays for parallelism -> weight 1/m
+        #   |m| <= tol  flat -> free to widen
+        #   m < -tol    energy falls as resources grow; possible, but usually a
+        #               profile too narrow to constrain the fit
         weights = {}
         flat_stages = []
         for stage in schedulable:
-            a, _ = stage.perf_model.energy_parameters
-            if a > ENERGY_SLOPE_TOL:
-                weights[stage.stage_id] = 1.0 / a
+            m = stage.perf_model.energy_marginal()
+            if m is None:
+                raise ValueError(
+                    f"Cannot schedule for energy: stage '{stage.stage_id}' has a "
+                    "fitted energy model but no profiled configurations to "
+                    "evaluate its slope at."
+                )
+            if m > ENERGY_SLOPE_TOL:
+                weights[stage.stage_id] = 1.0 / m
             else:
-                if a < -ENERGY_SLOPE_TOL:
+                if m < -ENERGY_SLOPE_TOL:
                     print(
                         f"[Ditto] Stage '{stage.stage_id}' fitted a negative energy "
-                        f"slope (a={a:.6g}). Treating it as flat; widen the profiled "
-                        "configuration space to confirm."
+                        f"slope (dE/dx={m:.6g}). Treating it as flat; widen the "
+                        "profiled configuration space to confirm."
                     )
                 flat_stages.append(stage.stage_id)
 
