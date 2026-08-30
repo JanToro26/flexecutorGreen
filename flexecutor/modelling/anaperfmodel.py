@@ -1,3 +1,4 @@
+import logging
 from typing import Dict
 
 import numpy as np
@@ -8,6 +9,8 @@ from flexecutor.modelling.perfmodel import PerfModel
 from flexecutor.utils.dataclass import FunctionTimes, StageConfig, ConfigBounds
 from flexecutor.modelling.energy_agg import stage_energy, _is_shared_meter
 
+logger = logging.getLogger(__name__)
+
 
 def phase_func(x, a, b):
     return a / x + b
@@ -17,46 +20,33 @@ io_func = comp_func = phase_func
 
 
 def coldstart_func(x, a, b):
-    """Cold start against allocated resource x (= vcpu * memory * workers).
+    """Cold start against x (= vcpu * memory * workers).
 
-    Affine rather than the 1/x shape used for the working phases. Read,
-    compute and write are work divided among workers, so they shrink as
-    resources grow. Cold start is not divided: every worker pays its own
-    start-up, and workers contend for admission, so the stage waits longer
-    the more of them there are. On a single pinned node this is close to
-    linear -- measured 6 s at 1 worker rising to 268 s at 64, i.e. a roughly
-    constant per-worker cost.
-
-    Affine also covers the independent-provisioning case (AWS Lambda, where
-    workers start in parallel and the term is near-constant): the fit simply
-    returns a ~ 0 and the intercept carries it. A 1/x shape cannot represent
-    growth at all, so it forces the optimiser to treat start-up as free at
-    high worker counts.
+    Affine, not 1/x: read/compute/write are work divided among workers, but
+    every worker pays its own start-up and they contend for admission, so
+    the term grows with the worker count (6 s at W=1, 268 s at W=64). On
+    Lambda, where workers start in parallel, the fit returns a ~ 0.
     """
     return a * x + b
 
 
 def energy_func(x, a, b):
-    """
-    Energy against allocated resource x (= vcpu * memory * workers).
+    """Energy against x, for independent per-worker meters (Lambda).
 
-    Deliberately affine rather than the 1/x shape used for the time phases.
-    Adding resources shortens a stage but does not reduce the work done, so
-    energy does not decay towards a floor the way latency does; it typically
-    rises, because more parallel capacity means more idle silicon powered for
-    the duration. Fitting energy with a latency-shaped curve would force the
-    optimiser to conclude that more workers are always more efficient, which
-    is the opposite of the effect being measured.
+    Affine, not 1/x: more resources shorten a stage but do not reduce the
+    work, so energy does not decay towards a floor.
     """
     return a * x + b
 
-def energy_func_shared(x, a, b):
-    """Energy against allocated resource x, for a shared whole-machine meter.
+def energy_func_shared(x, a, b, c):
+    """Energy against x, for a shared whole-machine meter (k8s RAPL).
 
-    With one package counter per node (k8s RAPL, workers pinned to one node),
-    measured energy is node power times the elapsed window.
+    Node power times elapsed time: falls as 1/x while the work is divided,
+    rises again as cold start grows. Convex, minimum at sqrt(a/b). A plain
+    a/x + b can only fall, so it fits a negative a on workloads whose work
+    grows with x and predicts negative joules.
     """
-    return a / x + b
+    return a / x + b * x + c
 
 
 def _has_numeric(series) -> bool:
@@ -124,10 +114,8 @@ class AnaPerfModel(PerfModel):
             )
         self._profiling_results = stage_profile_data
 
-        # `energy` is fitted only when every configuration actually carries it.
-        # Profiles recorded before energy collection existed are still valid
-        # for the latency and cost objectives; failing the whole training run
-        # for a missing energy series would throw away that data.
+        # Energy is fitted only when every configuration carries it. Older
+        # profiles without it stay valid for latency and cost.
         required = [k for k in FunctionTimes.profile_keys() if k != "energy"]
         for config_data in stage_profile_data.values():
             assert all(
@@ -205,24 +193,28 @@ class AnaPerfModel(PerfModel):
         # print(size2points_comp)
         # print(size2points_write)
 
-        def fit_params(data, func):
+        def fit_params(data, func, n_params=2, bounds=None, guess=None):
             assert isinstance(data, dict)
-            arr_x = list(data.keys())
-            arr_y = [data[x] for x in arr_x]
+            arr_x = np.array(list(data.keys()))
+            arr_y = np.array([data[x] for x in arr_x])
 
-            arr_x = np.array(arr_x)
-            arr_y = np.array(arr_y)
-
-            initial_guess = [1, 1]
+            initial_guess = guess if guess is not None else [1] * n_params
 
             def residuals(para, x, y):
-                predicted = func(x, *para)
-                residuals = predicted - y
-                return residuals
+                return func(x, *para) - y
 
-            params, _ = scipy_opt.leastsq(residuals, initial_guess, args=(arr_x, arr_y))
+            if bounds is None:
+                params, _ = scipy_opt.leastsq(
+                    residuals, initial_guess, args=(arr_x, arr_y)
+                )
+                return params.tolist()
 
-            return params.tolist()
+            res = scipy_opt.least_squares(
+                lambda para: residuals(para, arr_x, arr_y),
+                initial_guess,
+                bounds=bounds,
+            )
+            return res.x.tolist()
 
         # Fit the parameters
         # print("Fitting parameters...")
@@ -230,11 +222,26 @@ class AnaPerfModel(PerfModel):
         self._read_params = fit_params(size2points_read, io_func)
         self._comp_params = fit_params(size2points_comp, comp_func)
         self._write_params = fit_params(size2points_write, io_func)
-        if self._has_energy and len(size2points_energy) >= 2:
-            self._energy_params = fit_params(size2points_energy, self._energy_curve)
+        if self._has_energy and len(size2points_energy) >= self._energy_nparams:
+            if self._energy_shared_meter:
+                xs = np.array(list(size2points_energy.keys()))
+                ys = np.array(list(size2points_energy.values()))
+                # a >= 0 (energy divided among workers), b >= 0 (cost per extra
+                # unit). Unbounded, the fit goes negative and so do the joules.
+                self._energy_params = fit_params(
+                    size2points_energy,
+                    self._energy_curve,
+                    3,
+                    bounds=([0.0, 0.0, -np.inf], [np.inf, np.inf, np.inf]),
+                    guess=[float(ys.max() * xs.min()), 0.0, float(ys.min())],
+                )
+            else:
+                self._energy_params = fit_params(
+                    size2points_energy, self._energy_curve, 2
+                )
         else:
-            # A single configuration cannot constrain a two-parameter fit. Leave
-            # the model unfitted rather than returning a curve through one point.
+            # Fewer configurations than free parameters: leave it unfitted
+            # rather than pass a curve exactly through every point.
             self._energy_params = None
             self._has_energy = False
 
@@ -291,23 +298,19 @@ class AnaPerfModel(PerfModel):
         )
 
         a, b = self.parameters
-        print(
-            f"Predicted time: {a} / {key} + {b} = {total_predicted_time} = {(a / key) + b}"
+        logger.debug(
+            "Predicted time: %s / %s + %s = %s", a, key, b, total_predicted_time
         )
 
-        # Energy is predicted only when it was actually fitted from measured
-        # data. There is deliberately no proxy fallback here: substituting
-        # something like `k * vcpu * workers * time` would return a number that
-        # looks like a prediction but carries no measurement, and downstream
-        # code cannot tell the two apart. `None` forces the caller to handle
-        # the absence explicitly.
+        # Predicted only when fitted from measurement. No proxy fallback: a
+        # made-up number is indistinguishable from a real one downstream.
         predicted_energy = (
             self._energy_curve(key, *self._energy_params)
             if self._energy_params
             else None
         )
         if predicted_energy is not None:
-            print(f"Predicted energy: {predicted_energy:.4f} J at key={key}")
+            logger.debug("Predicted energy: %.4f J at key=%s", predicted_energy, key)
 
         return FunctionTimes(
             total=total_predicted_time,
@@ -319,24 +322,26 @@ class AnaPerfModel(PerfModel):
             energy_source="fitted_from_profile" if predicted_energy is not None else "none",
         )
 
-    def _energy_curve(self, x, a, b):
-        """The energy curve whose shape matches the meter behind the profile.
+    @property
+    def _energy_nparams(self):
+        """Free parameters of the energy curve for this profile's meter."""
+        return 3 if self._energy_shared_meter else 2
 
-        Independent per-worker meters -> affine rise (energy_func). One shared
-        whole-machine meter -> decay towards an idle-power floor
-        (energy_func_shared). Fitting and prediction must use the same shape,
-        so both go through here.
+    def _energy_curve(self, x, *params):
+        """Dispatch to the curve matching the profile's meter.
+
+        Fitting and prediction must use the same shape, so both come here.
         """
         if self._energy_shared_meter:
-            return energy_func_shared(x, a, b)
-        return energy_func(x, a, b)
+            return energy_func_shared(x, *params)
+        return energy_func(x, *params)
 
     @property
     def energy_parameters(self):
-        """Raw (a, b) of the fitted curve, or None if unfitted.
+        """Raw coefficients of the fitted curve, or None if unfitted.
 
-        a is a slope only for the affine shape; for E = a/x + b it is a
-        numerator. Use energy_marginal() if you want a slope.
+        a is a slope only for the affine shape. Use energy_marginal() for a
+        slope.
         """
         return tuple(self._energy_params) if self._energy_params else None
     
@@ -351,12 +356,11 @@ class AnaPerfModel(PerfModel):
         return sorted(xs)
 
     def energy_marginal(self, x=None):
-        """dE/dx at x -- what one more unit of resource costs in energy.
+        """dE/dx at x: what one more unit of resource costs in energy.
 
-        For the affine shape a is already the slope; for the shared-meter shape
-        E = a/x + b it is -a/x^2, so reading a directly flips the sign on RAPL
-        profiles. x defaults to the median profiled configuration. None when
-        the model is unfitted.
+        For the affine shape a is the slope; for a/x + b*x + c it is
+        -a/x^2 + b, so reading a directly flips the sign on RAPL profiles.
+        x defaults to the median profiled configuration.
         """
         if not self._energy_params:
             return None
@@ -365,11 +369,29 @@ class AnaPerfModel(PerfModel):
             if not xs:
                 return None
             x = xs[len(xs) // 2]
-        a = self._energy_params[0]
         if self._energy_shared_meter:
-            return -a / (x * x)
-        return a
+            a, b = self._energy_params[0], self._energy_params[1]
+            return -a / (x * x) + b
+        return self._energy_params[0]
     
+    def energy_optimal_x(self):
+        """The x minimising the fitted energy curve, or None.
+
+        sqrt(a/b) for the convex shape. None for the affine one, which has
+        no interior minimum, and None outside the profiled range: a b near
+        zero puts the minimum at absurd x.
+        """
+        if not self._energy_params or not self._energy_shared_meter:
+            return None
+        a, b = self._energy_params[0], self._energy_params[1]
+        if a <= 0 or b <= 0:
+            return None
+        xstar = float(np.sqrt(a / b))
+        xs = self._profiled_x()
+        if not xs or not (xs[0] <= xstar <= xs[-1]):
+            return None
+        return xstar
+
     @property
     def has_energy_model(self) -> bool:
         return bool(self._energy_params)
