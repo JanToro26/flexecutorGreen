@@ -7,7 +7,9 @@
     
 """
 
-SHARED_METER_SOURCES = {"rapl"}
+# perf stat -a is system-wide: every worker on a host reports the same machine
+# energy, so it is a shared meter like RAPL.
+SHARED_METER_SOURCES = {"rapl", "perf"}
 
 
 def _is_shared_meter(sources) -> bool:
