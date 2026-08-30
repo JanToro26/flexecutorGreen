@@ -45,4 +45,10 @@ def main(app="video", total_parallelism=12):
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--app", default="video", choices=sorted(APPS))
+    ap.add_argument("--budget", type=int, default=12)
+    args = ap.parse_args()
+    main(app=args.app, total_parallelism=args.budget)
