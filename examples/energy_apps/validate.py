@@ -97,6 +97,54 @@ def _pct_err(predicted: Optional[float], measured: Optional[float]) -> Optional[
     return abs(predicted - measured) / abs(measured) * 100.0
 
 
+def fit_stage_models(app: str, min_configs: int = 2):
+    """Fit one AnaPerfModel per stage from the stored profile.
+
+    Returns (dag, params_fn, executor, models, unfitted). The caller owns the
+    executor and must shut it down: the profile paths come from it, and callers
+    that go on to execute need the same instance.
+
+    A pinned stage profiles at one configuration by construction, so it lands in
+    `unfitted`. An unpinned stage without enough configurations is missing data
+    and raises.
+    """
+    if app not in APPS:
+        raise ValueError(f"Unknown app {app!r}; expected one of {sorted(APPS)}")
+
+    dag, params_fn = APPS[app]()
+    apply_pinning(app, dag)
+    executor = DAGExecutor(dag)
+
+    models: Dict[str, object] = {}
+    unfitted: Dict[str, str] = {}
+    try:
+        for stage in dag.stages:
+            path = get_asset_path(executor._base_path, dag, stage, AssetType.PROFILE)
+            profile = load_profiling_results(path)
+            if len(profile) < min_configs:
+                if getattr(stage, "pinned", False):
+                    logger.info(
+                        "[%s/%s] pinned, %d profiled configuration(s); not fitted.",
+                        app, stage.stage_id, len(profile),
+                    )
+                    unfitted[stage.stage_id] = "pinned"
+                    continue
+                raise RuntimeError(
+                    f"[{app}/{stage.stage_id}] needs at least {min_configs} profiled "
+                    f"configurations, found {len(profile)}. Run the harness first."
+                )
+            model = stage.init_perf_model(PerfModelEnum.ANALYTIC)
+            model.train(profile)
+            models[stage.stage_id] = model
+            if not getattr(model, "has_energy_model", False):
+                unfitted[stage.stage_id] = "no energy model"
+    except Exception:
+        executor.shutdown()
+        raise
+
+    return dag, params_fn, executor, models, unfitted
+
+
 def cross_validate(app: str) -> List[dict]:
     """Leave-one-config-out error per stage. Needs at least 3 profiled configs."""
     if app not in APPS:
@@ -175,46 +223,24 @@ def validate_against_run(
     averages over repetitions, and this machine slows measurably within a run,
     so a single execution here is systematically faster than a profiled mean.
     """
-    if app not in APPS:
-        raise ValueError(f"Unknown app {app!r}; expected one of {sorted(APPS)}")
-
-    dag, params_fn = APPS[app]()
+    # Pinned stages are excluded from the comparison: one profile key is correct
+    # for them and there is nothing to fit. They still execute, downstream
+    # stages need them. cross_validate does the same.
+    dag, params_fn, executor, models, _ = fit_stage_models(app)
     serial = SERIAL_STAGES[app]
-    apply_pinning(app, dag)
-    executor = DAGExecutor(dag)
     rows: List[dict] = []
 
     try:
-        predictions: Dict[str, object] = {}
-        for stage in dag.stages:
-            path = get_asset_path(executor._base_path, dag, stage, AssetType.PROFILE)
-            profile = load_profiling_results(path)
-            if len(profile) < 2:
-                if getattr(stage, "pinned", False):
-                    # Pinned to one worker by construction, so a single
-                    # profile key is correct and there is nothing to fit.
-                    # The stage still executes, because downstream stages
-                    # depend on it; it is only excluded from the
-                    # comparison. leave_one_config_out treats it the same
-                    # way.
-                    logger.info(
-                        "[%s/%s] pinned, %d profiled configuration(s); "
-                        "excluded from the comparison.",
-                        app, stage.stage_id, len(profile),
-                    )
-                    continue
-                # Not pinned, so this really is missing data rather than a
-                # design decision, and it should stop the run.
-                raise RuntimeError(
-                    f"[{app}/{stage.stage_id}] needs at least 2 profiled "
-                    f"configurations, found {len(profile)}. Run the harness first."
+        predictions: Dict[str, object] = {
+            stage_id: model.predict_time(
+                StageConfig(
+                    cpu=cpu,
+                    memory=memory,
+                    workers=1 if stage_id in serial else workers,
                 )
-            model = stage.init_perf_model(PerfModelEnum.ANALYTIC)
-            model.train(profile)
-            w = 1 if stage.stage_id in serial else workers
-            predictions[stage.stage_id] = model.predict_time(
-                StageConfig(cpu=cpu, memory=memory, workers=w)
             )
+            for stage_id, model in models.items()
+        }
 
         _apply_params(dag, params_fn(workers))
         for stage in dag.stages:

@@ -5,6 +5,9 @@
     python examples/energy_apps/run.py profile --apps video --workers 1 2 4 8 --reps 5
     python examples/energy_apps/run.py validate --apps ml
     python examples/energy_apps/run.py holdout --apps video --workers 6 --reps 5
+    python examples/energy_apps/run.py recommend --apps video --time-budget 12
+    python examples/energy_apps/run.py recommend --apps video --zero-shot --time-budget 0.8
+    python examples/energy_apps/run.py recommend --loao
 
 Run from the repository root.
 """
@@ -26,6 +29,14 @@ from examples.energy_apps.harness import (  # noqa: E402
     DEFAULT_MEMORY,
     DEFAULT_WORKERS,
     profile_all,
+)
+from examples.energy_apps.recommend import (  # noqa: E402
+    DEFAULT_WMAX,
+    leave_one_app_out,
+    print_loao,
+    print_sweep,
+    sweep,
+    sweep_zero_shot,
 )
 from examples.energy_apps.validate import (  # noqa: E402
     cross_validate,
@@ -72,7 +83,7 @@ def main() -> None:
     _resolve_config()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["profile", "validate", "holdout"])
+    ap.add_argument("command", choices=["profile", "validate", "holdout", "recommend"])
     ap.add_argument("--apps", nargs="*", default=None,
                     help=f"subset of {sorted(APPS)}; default: all")
     ap.add_argument("--workers", nargs="*", type=int, default=list(DEFAULT_WORKERS))
@@ -83,7 +94,22 @@ def main() -> None:
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--bucket", default="")
     ap.add_argument("--log", default="INFO")
+    # recommend only
+    ap.add_argument("--wmax", type=int, default=DEFAULT_WMAX,
+                    help="recommend: largest total parallelism budget to consider")
+    ap.add_argument("--time-budget", type=float, default=None,
+                    help="recommend: seconds; with --zero-shot, a multiple of "
+                         "the single-worker time instead")
+    ap.add_argument("--zero-shot", action="store_true",
+                    help="recommend: ignore the target app's own profile and "
+                         "borrow the normalised shapes measured on the others")
+    ap.add_argument("--loao", action="store_true",
+                    help="recommend: leave-one-app-out check of the zero-shot "
+                         "prior against each app's own profile")
     args = ap.parse_args()
+
+    if args.command != "recommend" and (args.zero_shot or args.loao):
+        ap.error("--zero-shot and --loao only apply to the recommend command")
 
     setup_logging(level=getattr(logging, args.log.upper(), logging.INFO))
     apps = args.apps or list(APPS)
@@ -120,6 +146,27 @@ def main() -> None:
                     ),
                     title="PREDICTED vs MEASURED",
                 )
+
+        elif args.command == "recommend":
+            if args.loao:
+                print_loao(
+                    leave_one_app_out(
+                        wmax=args.wmax, cpu=args.cpu[0], memory=args.memory[0]
+                    )
+                )
+                return
+            for app in apps:
+                if args.zero_shot:
+                    rows, dag, _ = sweep_zero_shot(
+                        app, wmax=args.wmax, cpu=args.cpu[0], memory=args.memory[0]
+                    )
+                    print_sweep(rows, dag, {}, time_budget=args.time_budget,
+                                relative=True)
+                else:
+                    rows, dag, unfitted = sweep(
+                        app, wmax=args.wmax, cpu=args.cpu[0], memory=args.memory[0]
+                    )
+                    print_sweep(rows, dag, unfitted, time_budget=args.time_budget)
 
     run()
 
