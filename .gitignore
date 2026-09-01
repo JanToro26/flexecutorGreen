@@ -94,6 +94,7 @@ celerybeat-schedule.*
 # dotenv
 .env
 .venv
+.venv-aws/
 
 # virtualenv
 venv/
