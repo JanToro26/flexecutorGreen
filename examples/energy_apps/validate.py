@@ -97,7 +97,31 @@ def _pct_err(predicted: Optional[float], measured: Optional[float]) -> Optional[
     return abs(predicted - measured) / abs(measured) * 100.0
 
 
-def fit_stage_models(app: str, min_configs: int = 2):
+def _key_collisions(profile, allow_parallel: bool = True):
+    """Configurations sharing one (s, W) key, which the fit averages together.
+
+    Only possible when cpu and memory trade off (cpu=2/512MB against
+    cpu=1/1024MB). Under the old scalar x = cpu*memory*workers, configurations
+    with different worker counts collided too, which train() could not ingest.
+    """
+    by_key = {}
+    for cpu, memory, workers in profile:
+        vcpu = cpu if allow_parallel else 1
+        by_key.setdefault((round(vcpu * memory, 1), workers), []).append(
+            (cpu, memory, workers)
+        )
+    return {k: sorted(v) for k, v in by_key.items() if len(v) > 1}
+
+
+def _describe(collisions) -> str:
+    return "; ".join(
+        f"s={key[0]:g} W={key[1]}: "
+        + ", ".join(f"(cpu={c:g}, mem={m:g}, W={w})" for c, m, w in configs)
+        for key, configs in sorted(collisions.items())
+    )
+
+
+def fit_stage_models(app: str, min_configs: int = 3):
     """Fit one AnaPerfModel per stage from the stored profile.
 
     Returns (dag, params_fn, executor, models, unfitted). The caller owns the
@@ -134,6 +158,22 @@ def fit_stage_models(app: str, min_configs: int = 2):
                     f"configurations, found {len(profile)}. Run the harness first."
                 )
             model = stage.init_perf_model(PerfModelEnum.ANALYTIC)
+
+            # The x parametrisation is inherited from Jolteon and is not fixed
+            # here. This only makes its failure legible: without the check the
+            # run dies inside numpy with a shape error that says nothing about
+            # the profile.
+            merged = _key_collisions(
+                profile, getattr(model, "allow_parallel", True)
+            )
+            if merged:
+                logger.warning(
+                    "[%s/%s] configurations sharing one (size, workers) key are "
+                    "averaged together: %s. The fit succeeds, but they are not "
+                    "the same allocation.",
+                    app, stage.stage_id, _describe(merged),
+                )
+
             model.train(profile)
             models[stage.stage_id] = model
             if not getattr(model, "has_energy_model", False):
@@ -146,7 +186,7 @@ def fit_stage_models(app: str, min_configs: int = 2):
 
 
 def cross_validate(app: str) -> List[dict]:
-    """Leave-one-config-out error per stage. Needs at least 3 profiled configs."""
+    """Leave-one-config-out error per stage. Needs at least 4 profiled configs."""
     if app not in APPS:
         raise ValueError(f"Unknown app {app!r}; expected one of {sorted(APPS)}")
 
@@ -159,9 +199,10 @@ def cross_validate(app: str) -> List[dict]:
         for stage in dag.stages:
             path = get_asset_path(executor._base_path, dag, stage, AssetType.PROFILE)
             profile = load_profiling_results(path)
-            if len(profile) < 3:
+            if len(profile) < 4:
                 logger.warning(
-                    "[%s/%s] %d profiled configuration(s); need at least 3. Skipping.",
+                    "[%s/%s] %d profiled configuration(s); leave-one-out over a "
+                    "3-parameter model needs at least 4. Skipping.",
                     app, stage.stage_id, len(profile),
                 )
                 continue
@@ -335,14 +376,14 @@ def print_report(rows: List[dict], title: str = "VALIDATION") -> None:
 
     table = [
         [
-            r["stage"], r["workers"],
+            r["stage"], format(r["cpu"] * r["memory"], "g"), r["workers"],
             fmt(r["energy_pred"]), fmt(r["energy_meas"]), fmt(r["energy_err_pct"], ".1f"),
             fmt(r["time_pred"]), fmt(r["time_meas"]), fmt(r["time_err_pct"], ".1f"),
             r["energy_source"],
         ]
         for r in rows
     ]
-    headers = ["Stage", "W", "E_pred(J)", "E_meas(J)", "E_err%",
+    headers = ["Stage", "s", "W", "E_pred(J)", "E_meas(J)", "E_err%",
                "t_pred(s)", "t_meas(s)", "t_err%", "source"]
 
     reps = rows[0].get("num_reps")
