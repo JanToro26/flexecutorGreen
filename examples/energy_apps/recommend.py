@@ -406,10 +406,9 @@ def print_sweep(rows, dag, unfitted, time_budget=None, relative=False) -> None:
         rising = all(rows[i]["energy_j"] <= rows[i + 1]["energy_j"]
                      for i in range(len(rows) - 1))
         if rising and not flat:
-            print("  NOTE: energy rises monotonically, so the minimum is budget=1 "
-                  "by construction. That is the affine curve fitted on a "
-                  "per-worker meter. An interior optimum needs the shared-meter "
-                  "curve a/x + b*x + c, which is what RAPL data fits.")
+            print("  NOTE: energy rises monotonically at this size, so the "
+                  "minimum is at the low end of the range. The fitted optimum "
+                  "W* = sqrt(a/(b*s)) falls below 1 here; smaller s raises it.")
 
 
 # --------------------------------------------------------------------------

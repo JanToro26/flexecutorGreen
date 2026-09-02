@@ -32,6 +32,7 @@ from examples.energy_apps.harness import (  # noqa: E402
 )
 from examples.energy_apps.recommend import (  # noqa: E402
     DEFAULT_WMAX,
+    _alloc_str,
     leave_one_app_out,
     print_loao,
     print_sweep,
@@ -162,11 +163,42 @@ def main() -> None:
                     )
                     print_sweep(rows, dag, {}, time_budget=args.time_budget,
                                 relative=True)
-                else:
+                    continue
+
+                # The budget sweep covers W; this loop covers s, so the
+                # recommendation is a (workers, size) pair.
+                sizes = [(c, m) for c in args.cpu for m in args.memory]
+                best = None
+                for cpu_v, mem_v in sizes:
+                    if len(sizes) > 1:
+                        print(f"\n--- per-worker size s = {cpu_v:g} x {mem_v:g} "
+                              f"= {cpu_v * mem_v:g} ---")
                     rows, dag, unfitted = sweep(
-                        app, wmax=args.wmax, cpu=args.cpu[0], memory=args.memory[0]
+                        app, wmax=args.wmax, cpu=cpu_v, memory=mem_v
                     )
                     print_sweep(rows, dag, unfitted, time_budget=args.time_budget)
+
+                    feasible = [r for r in rows if r["energy_j"]
+                                and (args.time_budget is None
+                                     or r["time_s"] <= args.time_budget)]
+                    if not feasible:
+                        continue
+                    cand = min(feasible, key=lambda r: r["energy_j"])
+                    if best is None or cand["energy_j"] < best[0]["energy_j"]:
+                        best = (cand, cpu_v, mem_v)
+
+                if len(sizes) > 1:
+                    print(f"\n=== MINIMUM OVER BOTH AXES : {app} ===")
+                    if best is None:
+                        print("  no configuration met the constraints.")
+                    else:
+                        row, cpu_v, mem_v = best
+                        print(f"  per-worker size s = {cpu_v * mem_v:g} "
+                              f"(cpu={cpu_v:g}, memory={mem_v:g})")
+                        print(f"  parallelism budget = {row['budget']}  "
+                              f"{_alloc_str(row['allocation'])}")
+                        print(f"  E = {row['energy_j']:.1f} J    "
+                              f"t = {row['time_s']:.1f} s")
 
     run()
 

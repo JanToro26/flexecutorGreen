@@ -1,56 +1,36 @@
 import logging
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import scipy.optimize as scipy_opt
 from overrides import overrides
 
 from flexecutor.modelling.perfmodel import PerfModel
-from flexecutor.utils.dataclass import FunctionTimes, StageConfig, ConfigBounds
+from flexecutor.utils.dataclass import FunctionTimes, StageConfig
 from flexecutor.modelling.energy_agg import stage_energy, _is_shared_meter
 
 logger = logging.getLogger(__name__)
 
-
-def phase_func(x, a, b):
-    return a / x + b
-
-
-io_func = comp_func = phase_func
+TIME_PHASES = ("cold_start", "read", "compute", "write")
+FITTED = TIME_PHASES + ("energy",)
+N_PARAMS = 3
 
 
-def coldstart_func(x, a, b):
-    """Cold start against x (= vcpu * memory * workers).
+def model_func(workers, size, a, b, c):
+    """f(W, s) = a/(W*s) + b*W + c, fitted for every quantity.
 
-    Affine, not 1/x: read/compute/write are work divided among workers, but
-    every worker pays its own start-up and they contend for admission, so
-    the term grows with the worker count (6 s at W=1, 268 s at W=64). On
-    Lambda, where workers start in parallel, the fit returns a ~ 0.
+    W is the worker count, s the per-worker resource size. The a term is work
+    divided among the workers, b the fixed cost each worker adds, c an offset.
+    b is what a scalar x = cpu*memory*workers cannot express: it makes
+    (512MB, W=4) and (2048MB, W=1) the same point when they measurably differ.
+
+    At fixed s this is (a/s)/W + b*W + c, so profiles swept over W alone fit
+    exactly as before. Convex for a, b >= 0, minimum at W* = sqrt(a/(b*s)).
     """
-    return a * x + b
-
-
-def energy_func(x, a, b):
-    """Energy against x, for independent per-worker meters (Lambda).
-
-    Affine, not 1/x: more resources shorten a stage but do not reduce the
-    work, so energy does not decay towards a floor.
-    """
-    return a * x + b
-
-def energy_func_shared(x, a, b, c):
-    """Energy against x, for a shared whole-machine meter (k8s RAPL).
-
-    Node power times elapsed time: falls as 1/x while the work is divided,
-    rises again as cold start grows. Convex, minimum at sqrt(a/b). A plain
-    a/x + b can only fall, so it fits a negative a on workloads whose work
-    grows with x and predicts negative joules.
-    """
-    return a / x + b * x + c
+    return a / (workers * size) + b * workers + c
 
 
 def _has_numeric(series) -> bool:
-    """True if a stored profile series contains at least one usable number."""
     for run in series or []:
         for value in run if isinstance(run, (list, tuple)) else [run]:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -58,7 +38,7 @@ def _has_numeric(series) -> bool:
     return False
 
 
-def _numeric_values(series):
+def _numeric_values(series) -> List[float]:
     """Flatten a stored profile series, dropping None and non-numeric entries."""
     out = []
     for run in series or []:
@@ -69,34 +49,74 @@ def _numeric_values(series):
 
 
 class AnaPerfModel(PerfModel):
-    """
-    AnaPerfModel records the mean parameter value.
-    Advantage: it is fast and accurate enough to optimize the average performance.
-    Shortcoming: it does not guarantee the bounded performance.
+    """Analytic energy and latency model over (workers, per-worker size).
 
-    Ditto, Caerus model.
-    Adapted from https://github.com/pkusys/Jolteon/blob/main/workflow/perf_model_analytic.py
+    One curve, `model_func`, per quantity per stage. Configurations are keyed on
+    the pair (s, W), never on their product, so allocations differing in worker
+    count stay distinct points.
+
+    s = cpu * memory folds the two per-worker quantities into one size. Lambda
+    ties vCPU to memory and exposes only memory; k8s enforces cpu while memory
+    limits do not change compute speed. So exactly one of the two varies on
+    either platform. predict_time refuses a size the profile never covered.
     """
 
     def __init__(self, stage) -> None:
         super().__init__("analytic", stage)
 
-        # Init in train, list with size three
-        self._write_params = None
-        self._read_params = None
-        self._comp_params = None
-        self._cold_params = None
-        self._energy_params = None
+        self._params: Dict[str, Optional[List[float]]] = {k: None for k in FITTED}
         self._has_energy = False
-        # True when the profile came from one shared whole-machine meter
-        # (k8s RAPL).
+        # One shared whole-machine meter (k8s RAPL) vs independent per-worker
+        # meters (Lambda). Decides max-vs-sum aggregation, not the curve shape.
         self._energy_shared_meter = False
-
         self._profiling_results = None
+        self._keys: Tuple[Tuple[float, int], ...] = ()
+
+    # ------------------------------------------------------------------
+    # configuration key
+    # ------------------------------------------------------------------
 
     @classmethod
-    def _config_to_xparam(cls, num_vcpu, memory, num_func):
-        return round(num_vcpu * memory * num_func, 1)
+    def _config_to_key(cls, num_vcpu, memory, num_func) -> Tuple[float, int]:
+        """(per-worker size, worker count)."""
+        return (round(float(num_vcpu) * float(memory), 1), int(num_func))
+
+    def _key(self, cpu, memory, workers) -> Tuple[float, int]:
+        vcpu = cpu if self.allow_parallel else 1
+        return self._config_to_key(vcpu, memory, workers)
+
+    @property
+    def profiled_sizes(self) -> Tuple[float, ...]:
+        return tuple(sorted({s for s, _ in self._keys}))
+
+    @property
+    def profiled_workers(self) -> Tuple[int, ...]:
+        return tuple(sorted({w for _, w in self._keys}))
+
+    def _check_size(self, size: float) -> None:
+        """Refuse a size the profile cannot speak to; warn when extrapolating."""
+        sizes = self.profiled_sizes
+        if not sizes:
+            return
+        if len(sizes) == 1:
+            if abs(size - sizes[0]) > 1e-6:
+                raise ValueError(
+                    f"[{self._stage_name}] profiled at one per-worker size "
+                    f"(s={sizes[0]:g}), asked to predict s={size:g}. The size axis "
+                    f"was never varied, so no coefficient describes it. Profile "
+                    f"more than one cpu or memory value first."
+                )
+            return
+        if size < sizes[0] or size > sizes[-1]:
+            logger.warning(
+                "[%s] s=%g outside the profiled range [%g, %g]; extrapolating "
+                "along the size axis.",
+                self._stage_name, size, sizes[0], sizes[-1],
+            )
+
+    # ------------------------------------------------------------------
+    # persistence (unused; the profile is the model)
+    # ------------------------------------------------------------------
 
     @overrides
     def save_model(self):
@@ -106,292 +126,221 @@ class AnaPerfModel(PerfModel):
     def load_model(self):
         pass
 
+    # ------------------------------------------------------------------
+    # fitting
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fit(points: Dict[Tuple[float, int], float]) -> Optional[List[float]]:
+        """Fit model_func to {(s, W): mean}. None if there are too few points.
+
+        a, b >= 0 is imposed. Unbounded, the fit returns a negative work or
+        per-worker term and then predicts negative joules outside the sweep.
+        """
+        if len(points) < N_PARAMS:
+            return None
+
+        keys = list(points)
+        size = np.array([k[0] for k in keys], dtype=float)
+        workers = np.array([k[1] for k in keys], dtype=float)
+        y = np.array([points[k] for k in keys], dtype=float)
+
+        guess = [float(max(y.max(), 0.0) * (workers * size).min()), 0.0, float(y.min())]
+        result = scipy_opt.least_squares(
+            lambda p: model_func(workers, size, *p) - y,
+            guess,
+            bounds=([0.0, 0.0, -np.inf], [np.inf, np.inf, np.inf]),
+            max_nfev=20000,
+        )
+        return result.x.tolist()
+
     @overrides
     def train(self, stage_profile_data: Dict) -> None:
-        if len(stage_profile_data) < 2:
+        if len(stage_profile_data) < N_PARAMS:
             raise ValueError(
-                "At least two profiled configurations for each stage are required to train the step model."
+                f"At least {N_PARAMS} profiled configurations are required to fit "
+                f"the model; got {len(stage_profile_data)}."
             )
         self._profiling_results = stage_profile_data
 
-        # Energy is fitted only when every configuration carries it. Older
-        # profiles without it stay valid for latency and cost.
-        required = [k for k in FunctionTimes.profile_keys() if k != "energy"]
         for config_data in stage_profile_data.values():
             assert all(
-                key in config_data for key in required
-            ), f"Each configuration's data must contain {required} keys."
+                key in config_data for key in TIME_PHASES
+            ), f"Each configuration's data must contain {list(TIME_PHASES)} keys."
 
         self._energy_shared_meter = False
-
+        # Energy is fitted only when every configuration carries it. Older
+        # profiles without it stay valid for latency and cost.
         self._has_energy = all(
             "energy" in cd and _has_numeric(cd["energy"])
             for cd in stage_profile_data.values()
         )
         if not self._has_energy:
-            print(
-                "[AnaPerfModel] No usable energy series in the profile; the energy "
-                "objective is unavailable for this stage. Re-profile with an "
-                "energy monitor active before scheduling for energy."
+            logger.info(
+                "[%s] no usable energy series; the energy objective is "
+                "unavailable for this stage.", self._stage_name,
             )
 
-        # print(f"Training Analytical performance model for {self._stage_name}")
-
-        size2points_coldstart = {}
-        size2points_read = {}
-        size2points_comp = {}
-        size2points_write = {}
-        size2points_energy = {}
+        points: Dict[str, Dict[Tuple[float, int], List[float]]] = {
+            name: {} for name in FITTED
+        }
 
         for config_tuple, data in stage_profile_data.items():
             num_vcpu, memory, num_func = config_tuple
-            # adapt to parallel mode
-            # if the stage does not allow more than one function, ignore num_func and set to 1
-            num_vcpu = num_vcpu if self.allow_parallel else 1
-            config_key = self._config_to_xparam(num_vcpu, memory, num_func)
+            key = self._key(num_vcpu, memory, num_func)
 
-            for size2points, phase in zip(
-                [
-                    size2points_coldstart,
-                    size2points_read,
-                    size2points_comp,
-                    size2points_write,
-                ],
-                ["cold_start", "read", "compute", "write"],
-            ):
-                if config_key not in size2points:
-                    size2points[config_key] = []
-                size2points[config_key].extend(data[phase])
+            for phase in TIME_PHASES:
+                points[phase].setdefault(key, []).extend(_numeric_values(data[phase]))
 
-            if self._has_energy:
-                if config_key not in size2points_energy:
-                    size2points_energy[config_key] = []
-                source_runs = data.get("energy_source") or []
-                for i, repetition in enumerate(data["energy"]):
-                    values = _numeric_values([repetition])
-                    if not values:
-                        continue
-                    srcs = source_runs[i] if i < len(source_runs) else []
-                    if not isinstance(srcs, (list, tuple)):
-                        srcs = [srcs]
-                    if _is_shared_meter(srcs):
-                        self._energy_shared_meter = True
-                    size2points_energy[config_key].append(stage_energy(values, srcs))
+            if not self._has_energy:
+                continue
+            source_runs = data.get("energy_source") or []
+            for i, repetition in enumerate(data["energy"]):
+                values = _numeric_values([repetition])
+                if not values:
+                    continue
+                srcs = source_runs[i] if i < len(source_runs) else []
+                if not isinstance(srcs, (list, tuple)):
+                    srcs = [srcs]
+                if _is_shared_meter(srcs):
+                    self._energy_shared_meter = True
+                points["energy"].setdefault(key, []).append(stage_energy(values, srcs))
 
-        for size2points in [
-            size2points_coldstart,
-            size2points_read,
-            size2points_comp,
-            size2points_write,
-            size2points_energy,
-        ]:
-            for config in size2points:
-                size2points[config] = np.mean(size2points[config])
+        means = {
+            name: {k: float(np.mean(v)) for k, v in series.items() if v}
+            for name, series in points.items()
+        }
+        self._keys = tuple(sorted(means["compute"]))
 
-        # print(size2points_coldstart)
-        # print(size2points_read)
-        # print(size2points_comp)
-        # print(size2points_write)
+        for name in TIME_PHASES:
+            self._params[name] = self._fit(means[name])
 
-        def fit_params(data, func, n_params=2, bounds=None, guess=None):
-            assert isinstance(data, dict)
-            arr_x = np.array(list(data.keys()))
-            arr_y = np.array([data[x] for x in arr_x])
+        self._params["energy"] = self._fit(means["energy"]) if self._has_energy else None
+        # Fewer configurations than free parameters: leave it unfitted rather
+        # than pass a curve exactly through every point.
+        self._has_energy = self._params["energy"] is not None
 
-            initial_guess = guess if guess is not None else [1] * n_params
-
-            def residuals(para, x, y):
-                return func(x, *para) - y
-
-            if bounds is None:
-                params, _ = scipy_opt.leastsq(
-                    residuals, initial_guess, args=(arr_x, arr_y)
-                )
-                return params.tolist()
-
-            res = scipy_opt.least_squares(
-                lambda para: residuals(para, arr_x, arr_y),
-                initial_guess,
-                bounds=bounds,
-            )
-            return res.x.tolist()
-
-        # Fit the parameters
-        # print("Fitting parameters...")
-        self._cold_params = fit_params(size2points_coldstart, coldstart_func)
-        self._read_params = fit_params(size2points_read, io_func)
-        self._comp_params = fit_params(size2points_comp, comp_func)
-        self._write_params = fit_params(size2points_write, io_func)
-        if self._has_energy and len(size2points_energy) >= self._energy_nparams:
-            if self._energy_shared_meter:
-                xs = np.array(list(size2points_energy.keys()))
-                ys = np.array(list(size2points_energy.values()))
-                # a >= 0 (energy divided among workers), b >= 0 (cost per extra
-                # unit). Unbounded, the fit goes negative and so do the joules.
-                self._energy_params = fit_params(
-                    size2points_energy,
-                    self._energy_curve,
-                    3,
-                    bounds=([0.0, 0.0, -np.inf], [np.inf, np.inf, np.inf]),
-                    guess=[float(ys.max() * xs.min()), 0.0, float(ys.min())],
-                )
-            else:
-                self._energy_params = fit_params(
-                    size2points_energy, self._energy_curve, 2
-                )
-        else:
-            # Fewer configurations than free parameters: leave it unfitted
-            # rather than pass a curve exactly through every point.
-            self._energy_params = None
-            self._has_energy = False
-
-        # print(
-        #     f"COLD START: alpha parameter = {self._cold_params[0]}, beta parameter = {self._cold_params[1]}"
-        # )
-        # print(
-        #     f"READ STEP: alpha parameter = {self._read_params[0]}, beta parameter = {self._read_params[1]}"
-        # )
-        # print(
-        #     f"COMPUTE STEP: alpha parameter = {self._comp_params[0]}, beta parameter = {self._comp_params[1]}"
-        # )
-        # print(
-        #     f"WRITE_STEP: alpha parameter = {self._write_params[0]}, beta parameter = {self._write_params[1]}"
-        # )
-
-    @property
-    @overrides
-    def parameters(self):
-        # parameter a (alpha), represents the paralelizable part, while beta is some non-paralellizable constant
-        a = sum(
-            [
-                self._cold_params[0],
-                self._read_params[0],
-                self._comp_params[0],
-                self._write_params[0],
-            ]
-        )
-        b = sum(
-            [
-                self._cold_params[1],
-                self._read_params[1],
-                self._comp_params[1],
-                self._write_params[1],
-            ]
-        )
-        return a, b
+    # ------------------------------------------------------------------
+    # prediction
+    # ------------------------------------------------------------------
 
     def predict_time(self, config: StageConfig) -> FunctionTimes:
         assert config.workers > 0
 
-        # FIXME: Use the parameter function to predict the time
-        # key = num_vcpu + runtime_memory + num_workers
-        key = self._config_to_xparam(config.cpu, config.memory, config.workers)
-        predicted_read_time = io_func(key, *self._read_params)
-        predicted_comp_time = comp_func(key, *self._comp_params)
-        predicted_write_time = io_func(key, *self._write_params)
-        predicted_cold_time = coldstart_func(key, *self._cold_params)
-        total_predicted_time = (
-            predicted_read_time
-            + predicted_comp_time
-            + predicted_write_time
-            + predicted_cold_time
-        )
+        size, workers = self._key(config.cpu, config.memory, config.workers)
+        self._check_size(size)
 
-        a, b = self.parameters
-        logger.debug(
-            "Predicted time: %s / %s + %s = %s", a, key, b, total_predicted_time
-        )
+        def value(name: str) -> Optional[float]:
+            params = self._params.get(name)
+            return float(model_func(workers, size, *params)) if params else None
 
-        # Predicted only when fitted from measurement. No proxy fallback: a
-        # made-up number is indistinguishable from a real one downstream.
-        predicted_energy = (
-            self._energy_curve(key, *self._energy_params)
-            if self._energy_params
-            else None
-        )
-        if predicted_energy is not None:
-            logger.debug("Predicted energy: %.4f J at key=%s", predicted_energy, key)
+        read = value("read") or 0.0
+        compute = value("compute") or 0.0
+        write = value("write") or 0.0
+        cold = value("cold_start") or 0.0
+        # Energy stays None when unfitted. No proxy fallback: a made-up number
+        # is indistinguishable from a real one downstream.
+        energy = value("energy")
 
         return FunctionTimes(
-            total=total_predicted_time,
-            read=predicted_read_time,
-            compute=predicted_comp_time,
-            write=predicted_write_time,
-            cold_start=predicted_cold_time,
-            energy=predicted_energy,
-            energy_source="fitted_from_profile" if predicted_energy is not None else "none",
+            total=read + compute + write + cold,
+            read=read,
+            compute=compute,
+            write=write,
+            cold_start=cold,
+            energy=energy,
+            energy_source="fitted_from_profile" if energy is not None else "none",
         )
 
-    @property
-    def _energy_nparams(self):
-        """Free parameters of the energy curve for this profile's meter."""
-        return 3 if self._energy_shared_meter else 2
-
-    def _energy_curve(self, x, *params):
-        """Dispatch to the curve matching the profile's meter.
-
-        Fitting and prediction must use the same shape, so both come here.
-        """
-        if self._energy_shared_meter:
-            return energy_func_shared(x, *params)
-        return energy_func(x, *params)
+    # ------------------------------------------------------------------
+    # coefficients and derived quantities
+    # ------------------------------------------------------------------
 
     @property
-    def energy_parameters(self):
-        """Raw coefficients of the fitted curve, or None if unfitted.
+    @overrides
+    def parameters(self):
+        """(a, c) summed over the latency phases. Two values, Ditto unpacks two.
 
-        a is a slope only for the affine shape. Use energy_marginal() for a
-        slope.
+        The bounds keep a non-negative, so the abs() the scheduler applies to
+        work around negative fits is no longer load-bearing. For b, use
+        time_marginal or energy_marginal.
         """
-        return tuple(self._energy_params) if self._energy_params else None
-    
-    def _profiled_x(self):
-        """The x values this stage was actually profiled at, ascending."""
-        if not self._profiling_results:
-            return []
-        xs = []
-        for cpu, memory, workers in self._profiling_results:
-            vcpu = cpu if self.allow_parallel else 1
-            xs.append(self._config_to_xparam(vcpu, memory, workers))
-        return sorted(xs)
+        fitted = [self._params[name] for name in TIME_PHASES if self._params[name]]
+        return (sum(p[0] for p in fitted), sum(p[2] for p in fitted))
 
-    def energy_marginal(self, x=None):
-        """dE/dx at x: what one more unit of resource costs in energy.
+    @property
+    def energy_parameters(self) -> Optional[Tuple[float, float, float]]:
+        """(a, b, c) of the energy curve, or None if unfitted."""
+        params = self._params.get("energy")
+        return tuple(params) if params else None
 
-        For the affine shape a is the slope; for a/x + b*x + c it is
-        -a/x^2 + b, so reading a directly flips the sign on RAPL profiles.
-        x defaults to the median profiled configuration.
-        """
-        if not self._energy_params:
+    @property
+    def per_worker_energy_cost(self) -> Optional[float]:
+        """b: joules each extra worker costs regardless of its size."""
+        params = self._params.get("energy")
+        return float(params[1]) if params else None
+
+    def _median_key(self) -> Optional[Tuple[float, int]]:
+        return self._keys[len(self._keys) // 2] if self._keys else None
+
+    def _resolve(self, workers, size):
+        """Default missing arguments to the median profiled configuration."""
+        median = self._median_key()
+        if median is None:
+            return None, None
+        return (median[1] if workers is None else workers,
+                median[0] if size is None else size)
+
+    def energy_marginal(self, workers=None, size=None) -> Optional[float]:
+        """dE/dW = -a/(W^2 * s) + b. Negative below the optimum, positive above."""
+        params = self._params.get("energy")
+        if not params:
             return None
-        if x is None:
-            xs = self._profiled_x()
-            if not xs:
+        workers, size = self._resolve(workers, size)
+        if workers is None:
+            return None
+        a, b, _ = params
+        return -a / (float(workers) ** 2 * float(size)) + b
+
+    def time_marginal(self, workers=None, size=None) -> Optional[float]:
+        """dt/dW summed over the latency phases."""
+        workers, size = self._resolve(workers, size)
+        if workers is None:
+            return None
+        total = 0.0
+        for name in TIME_PHASES:
+            params = self._params[name]
+            if params:
+                total += -params[0] / (float(workers) ** 2 * float(size)) + params[1]
+        return total
+
+    def energy_optimal_workers(self, size=None) -> Optional[float]:
+        """W* = sqrt(a/(b*s)), or None.
+
+        None when a coefficient is zero, so the curve is monotone, and None
+        outside the profiled worker range, where it is an extrapolation.
+        """
+        params = self._params.get("energy")
+        if not params:
+            return None
+        if size is None:
+            median = self._median_key()
+            if median is None:
                 return None
-            x = xs[len(xs) // 2]
-        if self._energy_shared_meter:
-            a, b = self._energy_params[0], self._energy_params[1]
-            return -a / (x * x) + b
-        return self._energy_params[0]
-    
-    def energy_optimal_x(self):
-        """The x minimising the fitted energy curve, or None.
-
-        sqrt(a/b) for the convex shape. None for the affine one, which has
-        no interior minimum, and None outside the profiled range: a b near
-        zero puts the minimum at absurd x.
-        """
-        if not self._energy_params or not self._energy_shared_meter:
-            return None
-        a, b = self._energy_params[0], self._energy_params[1]
+            size = median[0]
+        a, b, _ = params
         if a <= 0 or b <= 0:
             return None
-        xstar = float(np.sqrt(a / b))
-        xs = self._profiled_x()
-        if not xs or not (xs[0] <= xstar <= xs[-1]):
+        optimum = float(np.sqrt(a / (b * float(size))))
+        workers = self.profiled_workers
+        if not workers or not (workers[0] <= optimum <= workers[-1]):
             return None
-        return xstar
+        return optimum
 
     @property
     def has_energy_model(self) -> bool:
-        return bool(self._energy_params)
+        return bool(self._params.get("energy"))
+
+    @property
+    def is_shared_meter(self) -> bool:
+        return self._energy_shared_meter
