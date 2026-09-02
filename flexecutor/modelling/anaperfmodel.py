@@ -225,9 +225,12 @@ class AnaPerfModel(PerfModel):
             for name, series in points.items()
         }
         self._keys = tuple(sorted(means["compute"]))
-        # At one size a/u**q collapses to a single coefficient, so q is held at
-        # 1 and single-size profiles fit exactly as they did before.
-        self._fit_exponent = len(self.profiled_sizes) > 1
+        # q is identifiable only where the usable size varies: at one effective
+        # level a/u**q collapses to a single coefficient. Held at 1 otherwise,
+        # so single-size profiles fit exactly as they did before.
+        self._fit_exponent = len(
+            {self.effective_size(s) for s in self.profiled_sizes}
+        ) > 1
 
         if len(stage_profile_data) < self.min_configs:
             raise ValueError(
