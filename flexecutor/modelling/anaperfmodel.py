@@ -14,27 +14,26 @@ logger = logging.getLogger(__name__)
 TIME_PHASES = ("cold_start", "read", "compute", "write")
 FITTED = TIME_PHASES + ("energy",)
 
-#: Per-worker size at which one core is saturated; None disables the cap. A
-#: single-threaded stage gains nothing above it. Set from run.py: 1024 on k8s
-#: with memory fixed and cpu swept, ~1769 on Lambda (one vCPU).
+#: Per-worker size saturating one core; None disables the cap. Set from run.py:
+#: 1024 on k8s with cpu swept, ~1769 on Lambda.
 SIZE_SATURATION: Optional[float] = None
 
 
-def model_func(workers, size, a, b, c, q=1.0):
-    """a/(W * u**q) + b*W + c, where u = min(s, SIZE_SATURATION).
+def _throttled(size):
+    """1 where the worker is capped below a full core."""
+    if not SIZE_SATURATION:
+        return 0.0
+    return np.less(size, SIZE_SATURATION - 1e-9).astype(float)
 
-    a is work divided among the workers, b the fixed cost each worker adds,
-    c an offset. b is what a scalar x = cpu*memory*workers cannot express: it
-    makes (512MB, W=4) and (2048MB, W=1) the same point when they differ.
 
-    q is how strongly usable size converts into progress. It fits near 1 for
-    time and for energy on per-worker meters, near 2 on a shared package meter,
-    where a throttled worker runs longer and keeps the package powered for that
-    longer window. Unidentifiable at a single size, where it is held at 1.
+def model_func(workers, size, a, b, c, gamma=0.0):
+    """a*(1 + g*h)/(W*u) + b*W + c, u = min(s, SIZE_SATURATION), h = throttled.
 
-    Convex in W for a, b >= 0, minimum at W* = sqrt(a / (b * u**q)).
+    a is divisible work, b the fixed cost per worker, c an offset, g the extra
+    cost of running below one core (CFS descheduling: a step, not a slope).
+    Convex in W for a, b >= 0, minimum at W* = sqrt(a*(1 + g*h) / (b*u)).
     """
-    return a / (workers * size ** q) + b * workers + c
+    return a * (1 + gamma * _throttled(size)) / (workers * size) + b * workers + c
 
 
 def _has_numeric(series) -> bool:
@@ -46,7 +45,7 @@ def _has_numeric(series) -> bool:
 
 
 def _numeric_values(series) -> List[float]:
-    """Flatten a stored profile series, dropping None and non-numeric entries."""
+    """Flatten a profile series, dropping None and non-numeric entries."""
     out = []
     for run in series or []:
         for value in run if isinstance(run, (list, tuple)) else [run]:
@@ -58,35 +57,26 @@ def _numeric_values(series) -> List[float]:
 class AnaPerfModel(PerfModel):
     """Energy and latency over (workers, per-worker size), one curve per quantity.
 
-    Configurations are keyed on the pair (s, W), never their product, so
-    allocations differing in worker count stay distinct points.
-
-    s = cpu * memory folds the two per-worker quantities into one size: Lambda
-    ties vCPU to memory and exposes only memory, k8s enforces cpu while memory
-    limits do not change compute speed, so only one of the two ever varies.
-    predict_time refuses a size the profile never covered.
+    Keyed on the pair (s, W), never their product, so allocations differing in
+    worker count stay distinct. s = cpu * memory: only one of the two varies on
+    either platform.
     """
 
     def __init__(self, stage) -> None:
         super().__init__("analytic", stage)
 
-        # [a, b, c, q] per quantity; q stays 1.0 when it was not fitted.
+        # [a, b, c, g] per quantity; g stays 0.0 when not fitted.
         self._params: Dict[str, Optional[List[float]]] = {k: None for k in FITTED}
         self._has_energy = False
-        # Shared whole-machine meter (k8s RAPL) vs per-worker meters (Lambda).
-        # Decides max-vs-sum aggregation.
+        # Shared meter (k8s RAPL) vs per-worker (Lambda): max-vs-sum aggregation.
         self._energy_shared_meter = False
-        self._fit_exponent = False
+        self._fit_gamma = False
         self._profiling_results = None
         self._keys: Tuple[Tuple[float, int], ...] = ()
 
-    # ------------------------------------------------------------------
-    # configuration key
-    # ------------------------------------------------------------------
-
     @staticmethod
     def effective_size(size: float) -> float:
-        """Usable per-worker size, capped at one core when configured."""
+        """Usable per-worker size, capped at one core."""
         return min(size, SIZE_SATURATION) if SIZE_SATURATION else size
 
     @classmethod
@@ -108,7 +98,7 @@ class AnaPerfModel(PerfModel):
 
     @property
     def min_configs(self) -> int:
-        return 4 if self._fit_exponent else 3
+        return 4 if self._fit_gamma else 3
 
     def _check_size(self, size: float) -> None:
         """Refuse a size the profile cannot speak to; warn when extrapolating."""
@@ -129,10 +119,6 @@ class AnaPerfModel(PerfModel):
                 self._stage_name, size, sizes[0], sizes[-1],
             )
 
-    # ------------------------------------------------------------------
-    # persistence (unused; the profile is the model)
-    # ------------------------------------------------------------------
-
     @overrides
     def save_model(self):
         pass
@@ -141,15 +127,10 @@ class AnaPerfModel(PerfModel):
     def load_model(self):
         pass
 
-    # ------------------------------------------------------------------
-    # fitting
-    # ------------------------------------------------------------------
-
     def _fit(self, points: Dict[Tuple[float, int], float]) -> Optional[List[float]]:
-        """Fit model_func to {(s, W): mean}, returning [a, b, c, q] or None.
+        """Fit model_func to {(s, W): mean} -> [a, b, c, g], or None.
 
-        a, b >= 0 is imposed; unbounded the fit predicts negative joules outside
-        the sweep.
+        a, b >= 0; unbounded the fit predicts negative joules outside the sweep.
         """
         if len(points) < self.min_configs:
             return None
@@ -161,10 +142,10 @@ class AnaPerfModel(PerfModel):
 
         guess = [float(max(y.max(), 0.0) * (workers * size).min()), 0.0, float(y.min())]
         lower, upper = [0.0, 0.0, -np.inf], [np.inf, np.inf, np.inf]
-        if self._fit_exponent:
-            guess.append(1.0)
+        if self._fit_gamma:
+            guess.append(0.4)
             lower.append(0.0)
-            upper.append(4.0)
+            upper.append(10.0)
 
         result = scipy_opt.least_squares(
             lambda p: model_func(workers, size, *p) - y,
@@ -173,7 +154,7 @@ class AnaPerfModel(PerfModel):
             max_nfev=80000,
         )
         params = result.x.tolist()
-        return params if self._fit_exponent else params + [1.0]
+        return params if self._fit_gamma else params + [0.0]
 
     @overrides
     def train(self, stage_profile_data: Dict) -> None:
@@ -185,8 +166,7 @@ class AnaPerfModel(PerfModel):
             ), f"Each configuration's data must contain {list(TIME_PHASES)} keys."
 
         self._energy_shared_meter = False
-        # Fitted only when every configuration carries energy. Older profiles
-        # without it stay valid for latency and cost.
+        # Older profiles without energy stay valid for latency and cost.
         self._has_energy = all(
             "energy" in cd and _has_numeric(cd["energy"])
             for cd in stage_profile_data.values()
@@ -225,12 +205,9 @@ class AnaPerfModel(PerfModel):
             for name, series in points.items()
         }
         self._keys = tuple(sorted(means["compute"]))
-        # q is identifiable only where the usable size varies: at one effective
-        # level a/u**q collapses to a single coefficient. Held at 1 otherwise,
-        # so single-size profiles fit exactly as they did before.
-        self._fit_exponent = len(
-            {self.effective_size(s) for s in self.profiled_sizes}
-        ) > 1
+        # g needs throttled and unthrottled configurations to be identifiable.
+        usable = {self.effective_size(s) for s in self.profiled_sizes}
+        self._fit_gamma = len({bool(_throttled(u)) for u in usable}) > 1
 
         if len(stage_profile_data) < self.min_configs:
             raise ValueError(
@@ -242,13 +219,7 @@ class AnaPerfModel(PerfModel):
             self._params[name] = self._fit(means[name])
 
         self._params["energy"] = self._fit(means["energy"]) if self._has_energy else None
-        # Too few configurations for the free parameters: leave it unfitted
-        # rather than pass a curve through every point.
         self._has_energy = self._params["energy"] is not None
-
-    # ------------------------------------------------------------------
-    # prediction
-    # ------------------------------------------------------------------
 
     def predict_time(self, config: StageConfig) -> FunctionTimes:
         assert config.workers > 0
@@ -265,8 +236,7 @@ class AnaPerfModel(PerfModel):
         compute = value("compute") or 0.0
         write = value("write") or 0.0
         cold = value("cold_start") or 0.0
-        # None when unfitted. No proxy fallback: a made-up number is
-        # indistinguishable from a real one downstream.
+        # None when unfitted; no proxy fallback.
         energy = value("energy")
 
         return FunctionTimes(
@@ -279,24 +249,16 @@ class AnaPerfModel(PerfModel):
             energy_source="fitted_from_profile" if energy is not None else "none",
         )
 
-    # ------------------------------------------------------------------
-    # coefficients and derived quantities
-    # ------------------------------------------------------------------
-
     @property
     @overrides
     def parameters(self):
-        """(a, c) summed over the latency phases. Two values, Ditto unpacks two.
-
-        The bounds keep a non-negative, so the scheduler's abs() is no longer
-        load-bearing. For b, use time_marginal or energy_marginal.
-        """
+        """(a, c) summed over the latency phases. Ditto unpacks two."""
         fitted = [self._params[name] for name in TIME_PHASES if self._params[name]]
         return (sum(p[0] for p in fitted), sum(p[2] for p in fitted))
 
     @property
     def energy_parameters(self) -> Optional[Tuple[float, float, float, float]]:
-        """(a, b, c, q) of the energy curve, or None if unfitted."""
+        """(a, b, c, g) of the energy curve, or None if unfitted."""
         params = self._params.get("energy")
         return tuple(params) if params else None
 
@@ -307,8 +269,8 @@ class AnaPerfModel(PerfModel):
         return float(params[1]) if params else None
 
     @property
-    def size_exponent(self) -> Optional[float]:
-        """q of the energy curve. Near 1 for per-worker meters, near 2 shared."""
+    def throttle_penalty(self) -> Optional[float]:
+        """g: the extra energy cost of running below one core."""
         params = self._params.get("energy")
         return float(params[3]) if params else None
 
@@ -324,15 +286,15 @@ class AnaPerfModel(PerfModel):
                 self.effective_size(median[0] if size is None else size))
 
     def energy_marginal(self, workers=None, size=None) -> Optional[float]:
-        """dE/dW = -a/(W^2 * u^q) + b. Negative below the optimum, positive above."""
+        """dE/dW = -a*(1 + g*h)/(W^2 * u) + b. Negative below the optimum."""
         params = self._params.get("energy")
         if not params:
             return None
         workers, usable = self._resolve(workers, size)
         if workers is None:
             return None
-        a, b, _, q = params
-        return -a / (float(workers) ** 2 * usable ** q) + b
+        a, b, _, gamma = params
+        return -a * (1 + gamma * _throttled(usable)) / (float(workers) ** 2 * usable) + b
 
     def time_marginal(self, workers=None, size=None) -> Optional[float]:
         """dt/dW summed over the latency phases."""
@@ -343,26 +305,22 @@ class AnaPerfModel(PerfModel):
         for name in TIME_PHASES:
             params = self._params[name]
             if params:
-                total += -params[0] / (float(workers) ** 2 * usable ** params[3])
-                total += params[1]
+                scaled = params[0] * (1 + params[3] * _throttled(usable))
+                total += -scaled / (float(workers) ** 2 * usable) + params[1]
         return total
 
     def energy_optimal_workers(self, size=None) -> Optional[float]:
-        """W* = sqrt(a / (b * u^q)).
-
-        None when a coefficient is zero, so the curve is monotone, and None
-        outside the profiled worker range.
-        """
+        """W* = sqrt(a*(1 + g*h) / (b*u)), or None if monotone or extrapolated."""
         params = self._params.get("energy")
         if not params:
             return None
         _, usable = self._resolve(None, size)
         if usable is None:
             return None
-        a, b, _, q = params
+        a, b, _, gamma = params
         if a <= 0 or b <= 0:
             return None
-        optimum = float(np.sqrt(a / (b * usable ** q)))
+        optimum = float(np.sqrt(a * (1 + gamma * _throttled(usable)) / (b * usable)))
         workers = self.profiled_workers
         if not workers or not (workers[0] <= optimum <= workers[-1]):
             return None
