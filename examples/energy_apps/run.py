@@ -95,6 +95,10 @@ def main() -> None:
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--bucket", default="")
     ap.add_argument("--log", default="INFO")
+    ap.add_argument("--size-saturation", type=float, default=None,
+                    help="per-worker size saturating one core; a "
+                         "single-threaded stage gains nothing above it "
+                         "(1024 on k8s with cpu swept, ~1769 on Lambda)")
     # recommend only
     ap.add_argument("--wmax", type=int, default=DEFAULT_WMAX,
                     help="recommend: largest total parallelism budget to consider")
@@ -113,6 +117,9 @@ def main() -> None:
         ap.error("--zero-shot and --loao only apply to the recommend command")
 
     setup_logging(level=getattr(logging, args.log.upper(), logging.INFO))
+
+    from flexecutor.modelling import anaperfmodel
+    anaperfmodel.SIZE_SATURATION = args.size_saturation
     apps = args.apps or list(APPS)
 
     @flexorchestrator(bucket=args.bucket)

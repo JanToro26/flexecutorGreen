@@ -121,7 +121,7 @@ def _describe(collisions) -> str:
     )
 
 
-def fit_stage_models(app: str, min_configs: int = 3):
+def fit_stage_models(app: str, min_configs: int = 4):
     """Fit one AnaPerfModel per stage from the stored profile.
 
     Returns (dag, params_fn, executor, models, unfitted). The caller owns the
@@ -186,7 +186,7 @@ def fit_stage_models(app: str, min_configs: int = 3):
 
 
 def cross_validate(app: str) -> List[dict]:
-    """Leave-one-config-out error per stage. Needs at least 4 profiled configs."""
+    """Leave-one-config-out error per stage. Needs at least 5 profiled configs."""
     if app not in APPS:
         raise ValueError(f"Unknown app {app!r}; expected one of {sorted(APPS)}")
 
@@ -199,10 +199,10 @@ def cross_validate(app: str) -> List[dict]:
         for stage in dag.stages:
             path = get_asset_path(executor._base_path, dag, stage, AssetType.PROFILE)
             profile = load_profiling_results(path)
-            if len(profile) < 4:
+            if len(profile) < 5:
                 logger.warning(
-                    "[%s/%s] %d profiled configuration(s); leave-one-out over a "
-                    "3-parameter model needs at least 4. Skipping.",
+                    "[%s/%s] %d profiled configuration(s); leave-one-out needs "
+                    "at least 5. Skipping.",
                     app, stage.stage_id, len(profile),
                 )
                 continue
